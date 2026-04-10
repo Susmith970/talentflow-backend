@@ -56,6 +56,13 @@ RESUMES.mkdir(parents=True, exist_ok=True)
 
 _bg_threads: dict[str, threading.Thread] = {}
 
+# ── Token auth — avoids cross-origin cookie issues ────────────────────────────
+import secrets as _secrets
+_tokens: dict[str, str] = {}  # token → username
+
+def _new_token() -> str:
+    return _secrets.token_urlsafe(32)
+
 def bg(key: str, fn, *args, **kwargs):
     def _run():
         try: fn(*args, **kwargs)
@@ -67,6 +74,11 @@ def bg(key: str, fn, *args, **kwargs):
     return t
 
 def current_user() -> str | None:
+    # 1. Check Authorization: Bearer <token> header (production cross-origin)
+    auth = request.headers.get("Authorization", "")
+    if auth.startswith("Bearer "):
+        return _tokens.get(auth[7:])
+    # 2. Fallback: session cookie (local development)
     return session.get("username")
 
 def require_auth():
@@ -91,6 +103,16 @@ def auth_status():
     profile = db.get_profile(u)
     return jsonify({"logged_in": True, "profile": profile})
 
+@app.get("/api/auth/me")
+def auth_me():
+    u = current_user()
+    if not u:
+        return jsonify({"ok": False}), 401
+    profile = db.get_profile(u)
+    if not profile:
+        return jsonify({"ok": False}), 401
+    return jsonify({"ok": True, "profile": profile})
+
 @app.post("/api/auth/register")
 def register():
     data = request.json or {}
@@ -99,8 +121,12 @@ def register():
     result = db.create_profile(data)
     if result.get("error"):
         return jsonify(result), 400
-    session["username"] = result["profile"]["username"]
-    db.log(result["profile"]["username"], "Account created")
+    username = result["profile"]["username"]
+    session["username"] = username
+    token = _new_token()
+    _tokens[token] = username
+    db.log(username, "Account created")
+    result["token"] = token
     return jsonify(result)
 
 @app.post("/api/auth/login")
@@ -110,12 +136,19 @@ def login():
                               data.get("password",""))
     if result.get("error"):
         return jsonify(result), 401
-    session["username"] = result["profile"]["username"]
-    db.log(result["profile"]["username"], "Logged in")
+    username = result["profile"]["username"]
+    session["username"] = username
+    token = _new_token()
+    _tokens[token] = username
+    db.log(username, "Logged in")
+    result["token"] = token
     return jsonify(result)
 
 @app.post("/api/auth/logout")
 def logout():
+    auth = request.headers.get("Authorization", "")
+    if auth.startswith("Bearer "):
+        _tokens.pop(auth[7:], None)
     session.clear()
     return jsonify({"ok": True})
 
