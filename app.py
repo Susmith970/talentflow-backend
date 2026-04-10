@@ -28,11 +28,24 @@ if _is_prod:
     app.config["SESSION_COOKIE_HTTPONLY"] = True
 
 # Dynamic CORS — reads FRONTEND_URL from Railway/Render env vars
-_frontend = os.environ.get("FRONTEND_URL", "http://localhost:3000")
+# CORS — allow frontend + all vercel.app preview URLs
+# flask-cors supports regex strings in the origins list
+_frontend = os.environ.get("FRONTEND_URL", "")
+_origins = [
+    "http://localhost:3000",
+    "http://localhost:5173",
+    "http://127.0.0.1:3000",
+    r"https://.*\.vercel\.app",   # all Vercel deployments (regex)
+    r"https://.*\.railway\.app",  # all Railway deployments (regex)
+]
+if _frontend and _frontend not in _origins:
+    _origins.insert(0, _frontend)
+
 CORS(app, supports_credentials=True,
-     origins=[_frontend, "http://localhost:3000", "http://localhost:5173"],
-     allow_headers=["Content-Type","Authorization"],
-     methods=["GET","POST","PUT","PATCH","DELETE","OPTIONS"])
+     origins=_origins,
+     allow_headers=["Content-Type", "Authorization", "X-Requested-With"],
+     methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+     max_age=3600)
 
 # Use same DATA_DIR as db.py to ensure consistency
 # db.py handles the env var + flat/nested detection
