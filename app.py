@@ -92,7 +92,8 @@ def require_auth():
 
 @app.get("/api/health")
 def health():
-    return jsonify({"ok": True, "service": "TalentFlow API", "version": "1.0.0"})
+    return jsonify({"ok": True, "service": "TalentFlow API", "version": "1.4.0",
+                    "features": ["token-auth", "persistent-tokens", "extract-profile", "two-pass-tailor"]})
 
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
