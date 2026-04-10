@@ -528,19 +528,34 @@ def render_pdf(profile: dict, output_filename: str) -> str:
     name = (profile.get("name") or "Your Name").strip()
     story.append(Paragraph(_x(name), st_name))
 
-    # Build contact line — only non-empty values
+    # Build contact line: email | phone | location | linkedin | github
+    # Filters out deployment URLs (railway, vercel, heroku, render, localhost)
+    BAD_HOSTS = ("railway", "vercel", "herokuapp", "render.com", "localhost", "ngrok")
     contact_items = []
     for field in ("email", "phone", "location"):
         val = (profile.get(field) or "").strip()
         if val:
             contact_items.append(val)
-    for field, prefix in (("linkedin", ""), ("github", ""), ("website", "")):
-        val = (profile.get(field) or "").strip()
-        if val:
-            # Normalise URL display
-            if not val.startswith("http"):
-                val = val.lstrip("/")
-            contact_items.append(val)
+    # LinkedIn
+    li = (profile.get("linkedin") or "").strip()
+    if li:
+        li = li.lstrip("/")
+        if "linkedin.com" not in li:
+            li = "linkedin.com/in/" + li
+        contact_items.append(li)
+    # GitHub
+    gh = (profile.get("github") or "").strip()
+    if gh:
+        gh = gh.lstrip("/")
+        if "github.com" not in gh:
+            gh = "github.com/" + gh
+        contact_items.append(gh)
+    # Personal website — only if it's a real personal site
+    for ws_field in ("portfolio_url", "website"):
+        ws = (profile.get(ws_field) or "").strip()
+        if ws and not any(bad in ws.lower() for bad in BAD_HOSTS):
+            contact_items.append(ws)
+            break
 
     if contact_items:
         story.append(Paragraph(
@@ -665,13 +680,15 @@ def render_pdf(profile: dict, output_filename: str) -> str:
             "swift", "typescript", "javascript", "js", "ts", "c", "c++", "c#",
             "ruby", "rust", "php", "matlab", "bash", "shell", "html", "css",
         }
-        langs  = [s for s in all_skills if s.lower().split("/")[0].strip() in LANG_SET]
-        fworks = [s for s in all_skills if s not in langs]
+        langs  = [s for s in all_skills if s.lower().split("/")[0].strip() in LANG_SET][:12]
+        fworks = [s for s in all_skills if s not in langs][:12]
+        ml_cap = ml_skills[:12]
+        tools_cap = tools[:12]
 
-        if langs:      add_skill_row("Languages",   langs)
-        if fworks:     add_skill_row("Frameworks",  fworks)
-        if ml_skills:  add_skill_row("ML / AI",     ml_skills)
-        if tools:      add_skill_row("Tools",       tools)
+        if langs:     add_skill_row("Languages",   langs)
+        if fworks:    add_skill_row("Frameworks",  fworks)
+        if ml_cap:    add_skill_row("ML / AI",     ml_cap)
+        if tools_cap: add_skill_row("Tools",       tools_cap)
 
     # ── 7. CERTIFICATIONS ──────────────────────────────────────────────────
     def _clean_cert(raw: str) -> str:
@@ -705,6 +722,144 @@ def render_pdf(profile: dict, output_filename: str) -> str:
 
     doc.build(story)
     return str(output_path)
+
+
+# ---------------------------------------------------------------------------
+# Extract profile from uploaded base resume (PDF / DOCX / TXT)
+# Called by app.py /api/profile/upload-resume
+# ---------------------------------------------------------------------------
+def extract_profile_from_file(file_path: str) -> dict:
+    """
+    Parse a resume file and extract structured profile data using Claude.
+    Falls back to basic text extraction if no API key.
+    """
+    path = Path(file_path)
+    ext  = path.suffix.lower()
+
+    # ── Read raw text ────────────────────────────────────────────────────────
+    raw_text = ""
+    try:
+        if ext == ".pdf":
+            try:
+                from pdfminer.high_level import extract_text as pdf_extract
+                raw_text = pdf_extract(str(path))
+            except ImportError:
+                raw_text = path.read_bytes().decode("utf-8", errors="replace")
+        elif ext == ".docx":
+            try:
+                import zipfile, xml.etree.ElementTree as ET
+                with zipfile.ZipFile(str(path)) as z:
+                    xml_content = z.read("word/document.xml")
+                tree = ET.fromstring(xml_content)
+                ns   = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+                raw_text = " ".join(
+                    t.text for t in tree.iter("{http://schemas.openxmlformats.org/wordprocessingml/2006/main}t")
+                    if t.text
+                )
+            except Exception:
+                raw_text = path.read_text(errors="replace")
+        else:
+            raw_text = path.read_text(errors="replace")
+    except Exception as e:
+        return {"error": f"Could not read file: {e}"}
+
+    if not raw_text.strip():
+        return {"error": "Could not extract text from file"}
+
+    # ── If no API key, return raw text only ─────────────────────────────────
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        return {"raw_resume_text": raw_text[:5000]}
+
+    # ── Use Claude to extract structured data ────────────────────────────────
+    raw = _call_claude(
+        system=(
+            "You are a resume parser. Extract structured data from the resume text. "
+            "Return ONLY valid JSON with no markdown fences. Be thorough and accurate."
+        ),
+        prompt=(
+            f"Parse this resume and extract ALL information into this exact JSON structure.\n"
+            f"Extract every job, every bullet point, every skill, every project — nothing missing.\n\n"
+            f"RESUME TEXT:\n{raw_text[:6000]}\n\n"
+            f"Return this JSON (fill every field you can find, leave empty string/array if not found):\n"
+            f"{{\n"
+            f'  "name": "Full Name",\n'
+            f'  "email": "email@example.com",\n'
+            f'  "phone": "+1-xxx-xxx-xxxx",\n'
+            f'  "location": "City, State",\n'
+            f'  "linkedin": "linkedin.com/in/username",\n'
+            f'  "github": "github.com/username",\n'
+            f'  "website": "",\n'
+            f'  "title": "Current Job Title",\n'
+            f'  "summary": "Professional summary paragraph",\n'
+            f'  "years_experience": 5,\n'
+            f'  "current_company": "Most recent company name",\n'
+            f'  "target_roles": ["Role from resume"],\n'
+            f'  "experience": [\n'
+            f'    {{\n'
+            f'      "title": "Job Title",\n'
+            f'      "company": "Company Name",\n'
+            f'      "location": "City, State",\n'
+            f'      "dates": "Mon YYYY - Mon YYYY",\n'
+            f'      "bullets": ["Achievement bullet 1", "Achievement bullet 2"]\n'
+            f'    }}\n'
+            f'  ],\n'
+            f'  "education": [\n'
+            f'    {{\n'
+            f'      "degree": "Degree Name",\n'
+            f'      "school": "School Name",\n'
+            f'      "location": "City, State",\n'
+            f'      "dates": "Mon YYYY - Mon YYYY",\n'
+            f'      "gpa": "",\n'
+            f'      "honors": "Awards/honors if any"\n'
+            f'    }}\n'
+            f'  ],\n'
+            f'  "projects": [\n'
+            f'    {{\n'
+            f'      "name": "Project Name",\n'
+            f'      "technologies": "Tech1, Tech2",\n'
+            f'      "dates": "",\n'
+            f'      "url": "",\n'
+            f'      "bullets": ["What it does and impact"]\n'
+            f'    }}\n'
+            f'  ],\n'
+            f'  "skills": ["Python", "SQL"],\n'
+            f'  "ml_skills": ["PyTorch", "PySpark"],\n'
+            f'  "tools": ["AWS", "Docker"],\n'
+            f'  "certifications": ["Cert 1"],\n'
+            f'  "awards": []\n'
+            f"}}"
+        ),
+        max_tokens=4096,
+    )
+
+    extracted = _parse_json_response(raw)
+
+    if not extracted or not isinstance(extracted, dict):
+        return {"raw_resume_text": raw_text[:5000], "error": "Could not parse resume structure"}
+
+    # Validate and clean extracted data
+    # Ensure experience bullets are actual lists
+    for exp in (extracted.get("experience") or []):
+        if isinstance(exp.get("bullets"), str):
+            exp["bullets"] = [b.strip() for b in exp["bullets"].split("\n") if b.strip()]
+
+    # Calculate years_experience from dates if not extracted
+    if not extracted.get("years_experience") and extracted.get("experience"):
+        import datetime
+        total_months = 0
+        current_year = datetime.datetime.now().year
+        for exp in extracted.get("experience", []):
+            dates = str(exp.get("dates", ""))
+            years = re.findall(r"(\d{4})", dates)
+            if len(years) >= 2:
+                total_months += (int(years[1]) - int(years[0])) * 12
+            elif len(years) == 1:
+                total_months += (current_year - int(years[0])) * 12
+        if total_months > 0:
+            extracted["years_experience"] = max(1, round(total_months / 12))
+
+    extracted["raw_resume_text"] = raw_text[:5000]
+    return extracted
 
 
 # ---------------------------------------------------------------------------
