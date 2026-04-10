@@ -13,7 +13,7 @@ from flask import Flask, jsonify, request, send_file, abort, session
 from flask_cors import CORS
 from dotenv import load_dotenv
 
-load_dotenv(Path(__file__).parent.parent / ".env")
+load_dotenv(Path(__file__).parent / ".env")  # .env sits next to app.py at root
 
 import db
 
@@ -35,8 +35,15 @@ CORS(app, supports_credentials=True,
      methods=["GET","POST","PUT","PATCH","DELETE","OPTIONS"])
 
 # Data directory — use DATA_DIR env var in production for persistence
+# When flat (Railway): data/ sits next to app.py
+# When local (nested): data/ is at project root
 _data_root = os.environ.get("DATA_DIR", "")
-ROOT    = Path(_data_root) if _data_root else Path(__file__).parent.parent
+if _data_root:
+    ROOT = Path(_data_root)
+elif (Path(__file__).parent / "data").exists():
+    ROOT = Path(__file__).parent          # flat: data/ next to app.py
+else:
+    ROOT = Path(__file__).parent.parent   # nested: data/ at project root
 DATA    = ROOT / "data"
 RESUMES = DATA / "resumes"
 DATA.mkdir(parents=True, exist_ok=True)
