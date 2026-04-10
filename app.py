@@ -392,7 +392,13 @@ def list_resumes():
 
 @app.get("/api/resume/download/<filename>")
 def dl_resume(filename):
-    require_auth()
+    # Accept token via query param for direct browser downloads
+    # (browsers can't send Authorization headers on <a href> clicks)
+    qs_token = request.args.get("token","")
+    if qs_token and qs_token in _tokens:
+        pass  # valid token in query string
+    else:
+        require_auth()  # falls back to header or session
     safe = re.sub(r"[^a-zA-Z0-9_\-\.]","",filename)
     p = RESUMES / safe
     if not p.exists(): return abort(404)
