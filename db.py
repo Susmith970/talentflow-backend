@@ -7,9 +7,18 @@ import json, threading, time, hashlib, os
 from pathlib import Path
 from datetime import datetime
 
-ROOT     = Path(__file__).parent.parent
-DATA_DIR = ROOT / "data"
-DATA_DIR.mkdir(exist_ok=True)
+# Support both flat deployment (Railway: files at /app/*.py)
+# and nested deployment (local: files at /project/backend/*.py)
+_here = Path(__file__).parent
+_data_env = os.environ.get("DATA_DIR", "")
+if _data_env:
+    DATA_DIR = Path(_data_env) / "data"
+elif (_here / "data").exists() or not (_here.parent / "data").exists():
+    DATA_DIR = _here / "data"        # flat: /app/data/
+else:
+    DATA_DIR = _here.parent / "data" # nested: /project/data/
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+ROOT = DATA_DIR.parent
 
 _locks: dict[str, threading.Lock] = {}
 
