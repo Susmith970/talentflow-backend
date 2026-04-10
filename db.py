@@ -181,6 +181,29 @@ def update_profile(username: str, updates: dict) -> dict:
             return {"ok": True, "profile": {k: v for k, v in p.items() if k != "password_hash"}}
     return {"error": "User not found"}
 
+# ── Token persistence (survives redeploys) ────────────────────────────────────
+
+TOKENS_FILE = "tokens.json"
+
+def save_token(token: str, username: str):
+    tokens = read(TOKENS_FILE, {})
+    tokens[token] = {"username": username, "created": datetime.now().isoformat()}
+    # Keep only last 100 tokens per user to prevent unbounded growth
+    write(TOKENS_FILE, tokens)
+
+def get_token_user(token: str) -> str | None:
+    if not token:
+        return None
+    tokens = read(TOKENS_FILE, {})
+    entry  = tokens.get(token)
+    return entry.get("username") if isinstance(entry, dict) else None
+
+def delete_token(token: str):
+    tokens = read(TOKENS_FILE, {})
+    tokens.pop(token, None)
+    write(TOKENS_FILE, tokens)
+
+
 def profiles_exist() -> bool:
     profiles = read(PROFILES_FILE, [])
     return len(profiles) > 0

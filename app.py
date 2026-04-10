@@ -56,9 +56,8 @@ RESUMES.mkdir(parents=True, exist_ok=True)
 
 _bg_threads: dict[str, threading.Thread] = {}
 
-# ── Token auth — avoids cross-origin cookie issues ────────────────────────────
+# ── Token auth — persisted in db so tokens survive redeploys ─────────────────
 import secrets as _secrets
-_tokens: dict[str, str] = {}  # token → username
 
 def _new_token() -> str:
     return _secrets.token_urlsafe(32)
@@ -77,8 +76,12 @@ def current_user() -> str | None:
     # 1. Check Authorization: Bearer <token> header (production cross-origin)
     auth = request.headers.get("Authorization", "")
     if auth.startswith("Bearer "):
-        return _tokens.get(auth[7:])
-    # 2. Fallback: session cookie (local development)
+        return db.get_token_user(auth[7:])
+    # 2. Check ?token= query param (for direct file downloads)
+    qs_tok = request.args.get("token", "")
+    if qs_tok:
+        return db.get_token_user(qs_tok)
+    # 3. Fallback: session cookie (local development only)
     return session.get("username")
 
 def require_auth():
@@ -124,7 +127,7 @@ def register():
     username = result["profile"]["username"]
     session["username"] = username
     token = _new_token()
-    _tokens[token] = username
+    db.save_token(token, username)
     db.log(username, "Account created")
     result["token"] = token
     return jsonify(result)
@@ -139,7 +142,7 @@ def login():
     username = result["profile"]["username"]
     session["username"] = username
     token = _new_token()
-    _tokens[token] = username
+    db.save_token(token, username)
     db.log(username, "Logged in")
     result["token"] = token
     return jsonify(result)
@@ -148,7 +151,7 @@ def login():
 def logout():
     auth = request.headers.get("Authorization", "")
     if auth.startswith("Bearer "):
-        _tokens.pop(auth[7:], None)
+        db.delete_token(auth[7:])
     session.clear()
     return jsonify({"ok": True})
 
@@ -392,17 +395,13 @@ def list_resumes():
 
 @app.get("/api/resume/download/<filename>")
 def dl_resume(filename):
-    # Accept token via query param for direct browser downloads
-    # (browsers can't send Authorization headers on <a href> clicks)
-    qs_token = request.args.get("token","")
-    if qs_token and qs_token in _tokens:
-        pass  # valid token in query string
-    else:
-        require_auth()  # falls back to header or session
+    # current_user() handles: Authorization header, ?token= param, session cookie
+    require_auth()
     safe = re.sub(r"[^a-zA-Z0-9_\-\.]","",filename)
     p = RESUMES / safe
     if not p.exists(): return abort(404)
-    return send_file(str(p), as_attachment=True, download_name=safe)
+    return send_file(str(p), as_attachment=True, download_name=safe,
+                     mimetype="application/pdf")
 
 
 # ── Auto-apply ────────────────────────────────────────────────────────────────
