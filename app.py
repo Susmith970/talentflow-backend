@@ -387,17 +387,20 @@ def gen_resume():
     if result.get("error"):
         return jsonify(result), 500
 
-    # Tag resume filename with username prefix
+    # Move to user-namespaced path in app RESUMES dir
     user_filename = f"{u}_{result['filename']}"
     try:
         import shutil
-        src = Path(result["path"])
-        dst = RESUMES / user_filename
-        shutil.move(str(src), str(dst))
+        src_p = Path(result["path"])
+        dst_p = RESUMES / user_filename
+        RESUMES.mkdir(parents=True, exist_ok=True)
+        if src_p.exists():
+            shutil.move(str(src_p), str(dst_p))
         result["filename"] = user_filename
-        result["path"]     = str(dst)
+        result["path"]     = str(dst_p)
         result["url"]      = f"/api/resume/download/{user_filename}"
-    except Exception: pass
+    except Exception as _mv_err:
+        print(f"  Warning: could not move resume: {_mv_err}")
 
     if jid:
         db.update_job(u, jid,
@@ -639,14 +642,17 @@ def apply_from_url():
         # Move to user-namespaced path
         src_path = Path(res["path"])
         dst_name = f"{u}_{src_path.name}"
-        dst_path = src_path.parent / dst_name
+        # Always move to the app's RESUMES dir so downloads work
+        dst_path = RESUMES / dst_name
+        RESUMES.mkdir(parents=True, exist_ok=True)
         if src_path.exists():
             shutil.move(str(src_path), str(dst_path))
-            res["filename"] = dst_name
-            res["path"]     = str(dst_path)
+        res["filename"] = dst_name
+        res["path"]     = str(dst_path)
+        res["url"]      = f"/api/resume/download/{dst_name}"
         db.update_job(u, job_id,
-                      resume_path     = res["path"],
-                      resume_filename = res["filename"],
+                      resume_path     = str(dst_path),
+                      resume_filename = dst_name,
                       status          = "ready",
                       ats_score       = res.get("ats_score", 0),
                       match_label     = res.get("match_label", ""),

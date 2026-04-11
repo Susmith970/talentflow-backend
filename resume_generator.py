@@ -303,6 +303,7 @@ RULES:
 • Most recent job: 5-6 bullets. Each earlier job: 3-4 bullets.
 • Every bullet: [Power verb] + [specific technical action] + [JD keyword] + [metric]
 • Summary: 3-4 sentences, mirrors JD language, leads with years + domain
+• CRITICAL: Return ALL experience entries. If input has 5 jobs, return 5 jobs. Never omit any.
 
 BULLET FORMULA EXAMPLES:
 • "Engineered a real-time Kafka ingestion layer processing 2M+ events/day,
@@ -328,22 +329,39 @@ Return ONLY this JSON (no markdown, no commentary):
         return dict(profile)
 
     # Merge — lock factual fields, take Claude\'s creative bullets
-    result   = dict(profile)
-    orig_exp = profile.get("experience") or []
-    orig_prj = profile.get("projects") or []
+    # CRITICAL: iterate orig_exp (not tailored list) so ALL jobs always appear.
+    # Claude sometimes returns fewer jobs than given — that must never drop a job.
+    result        = dict(profile)
+    orig_exp      = profile.get("experience") or []
+    orig_prj      = profile.get("projects") or []
+    tailored_exps = tailored.get("experience", [])
 
     if tailored.get("summary"):
         result["summary"] = tailored["summary"]
 
+    # Build lookup: normalised company name → tailored bullets
+    def _norm(s): return re.sub(r"\W+", "", str(s or "").lower())
+    tailored_map = {}
+    for i, texp in enumerate(tailored_exps):
+        key = _norm(texp.get("company", "")) or f"__idx_{i}"
+        tailored_map[key] = texp.get("bullets", [])
+        # also index by position
+        tailored_map[f"__idx_{i}"] = tailored_map.get(f"__idx_{i}") or texp.get("bullets", [])
+
     safe_exp = []
-    for i, exp in enumerate(tailored.get("experience", [])):
-        orig = orig_exp[i] if i < len(orig_exp) else {}
+    for i, orig in enumerate(orig_exp):
+        # Try company-name match first, then positional fallback, then keep original
+        key         = _norm(orig.get("company", ""))
+        pos_key     = f"__idx_{i}"
+        new_bullets = (tailored_map.get(key) or
+                       tailored_map.get(pos_key) or
+                       orig.get("bullets", []))
         safe_exp.append({
-            "title":    orig.get("title",    exp.get("title", "")),
-            "company":  orig.get("company",  exp.get("company", "")),
-            "location": orig.get("location", exp.get("location", "")),
-            "dates":    orig.get("dates",    exp.get("dates", "")),
-            "bullets":  exp.get("bullets",   orig.get("bullets", [])),
+            "title":    orig.get("title",    ""),
+            "company":  orig.get("company",  ""),
+            "location": orig.get("location", ""),
+            "dates":    orig.get("dates",    ""),
+            "bullets":  new_bullets if new_bullets else orig.get("bullets", []),
         })
     result["experience"] = safe_exp
 

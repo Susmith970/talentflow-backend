@@ -1218,22 +1218,39 @@ def _greenhouse_api(job, profile, username, board, job_id):
 
 def _greenhouse_playwright(job: dict, profile: dict, username: str,
                             apply_url: str) -> dict:
-    """Greenhouse via browser — fallback when API fails."""
+    """Greenhouse via Playwright browser with full diagnostic logging."""
     sp, _ = _pw()
     if not sp:
+        db.log(username, "  [PW] Playwright not installed — cannot use browser fallback")
         return _nope("greenhouse", "Playwright not installed", job)
+
+    def L(msg):
+        db.log(username, f"  [PW] {msg}")
 
     cover      = _cover_letter(profile, job)
     name_parts = (profile.get("name", "") or "Candidate").split()
+    resume_path = job.get("resume_path") or profile.get("base_resume_path", "")
+
+    L(f"Launching Chromium headless for: {apply_url[:80]}")
 
     with sp() as p:
-        browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
+        browser = p.chromium.launch(headless=True, args=["--no-sandbox","--disable-dev-shm-usage"])
         page    = browser.new_page()
         try:
-            page.goto(apply_url, wait_until="domcontentloaded", timeout=25000)
-            _jitter(1, 2)
+            page.goto(apply_url, wait_until="domcontentloaded", timeout=30000)
+            _jitter(1.5, 2.5)
+            L(f"Page loaded: {page.url[:80]}")
+            L(f"Page title: {page.title()[:60]}")
 
-            # Standard Greenhouse field IDs
+            # Detect if page is actually an application form
+            form_count = page.locator("form").count()
+            input_count = page.locator("input:visible").count()
+            L(f"Found: {form_count} form(s), {input_count} visible input(s)")
+
+            if input_count == 0:
+                L("WARNING: No visible inputs found — may not be on the application form")
+
+            # ── Standard Greenhouse field IDs ──────────────────────────────
             std = {
                 "#first_name":                   name_parts[0] if name_parts else "",
                 "#last_name":                    " ".join(name_parts[1:]) if len(name_parts) > 1 else "",
@@ -1244,72 +1261,217 @@ def _greenhouse_playwright(job: dict, profile: dict, username: str,
                 "#job_application_website":      profile.get("website", ""),
                 "input[id*='github']":           _fmt_url(profile.get("github", ""), "https://github.com/"),
             }
+            filled_std = []
+            skipped_std = []
             for sel, val in std.items():
-                if not val: continue
+                if not val:
+                    skipped_std.append(sel)
+                    continue
                 try:
                     el = page.locator(sel)
                     if el.count() > 0:
-                        _safe_fill(el.first, val)
+                        try:
+                            el.first.fill(str(val))
+                            filled_std.append(f"{sel}={val[:30]}")
+                            _jitter(0.1, 0.3)
+                        except Exception as fe:
+                            skipped_std.append(f"{sel} (fill error: {fe})")
+                    else:
+                        skipped_std.append(f"{sel} (not found)")
                 except Exception:
                     pass
 
-            # Resume upload
-            resume_path = job.get("resume_path") or profile.get("base_resume_path", "")
+            L(f"Standard fields filled: {len(filled_std)}")
+            for f_ in filled_std:
+                L(f"  ✓ {f_}")
+            if skipped_std:
+                L(f"  Skipped (not on page): {len(skipped_std)}")
+
+            # ── Resume upload ──────────────────────────────────────────────
             if resume_path and Path(resume_path).exists():
-                for fi_sel in ("#resume", "input[id*=resume]", "input[type=file]"):
+                L(f"Resume path: {resume_path}")
+                resume_uploaded = False
+                for fi_sel in ("#resume", "input[id*=resume]", "input[name*=resume]", "input[type=file]"):
                     fi = page.locator(fi_sel)
-                    if fi.count() > 0:
+                    cnt = fi.count()
+                    if cnt > 0:
                         try:
                             fi.first.set_input_files(resume_path)
-                            _jitter(1.5, 2.5)
+                            L(f"  ✓ Resume uploaded via selector: {fi_sel}")
+                            resume_uploaded = True
+                            _jitter(2, 3)
                             break
-                        except Exception:
-                            pass
+                        except Exception as ue:
+                            L(f"  ✗ Resume upload failed ({fi_sel}): {ue}")
+                if not resume_uploaded:
+                    L("  ✗ Could not upload resume — no matching file input found")
+            else:
+                L(f"  ✗ Resume file missing or path invalid: {resume_path}")
 
-            # Cover letter textarea
-            for cl_sel in ("textarea[id*=cover]", "#cover_letter", "textarea[name*=cover]"):
+            # ── Cover letter ───────────────────────────────────────────────
+            cl_filled = False
+            for cl_sel in ("textarea[id*=cover]", "#cover_letter", "textarea[name*=cover]",
+                           "textarea[placeholder*=cover i]"):
                 cl = page.locator(cl_sel)
                 if cl.count() > 0:
                     try:
-                        _safe_fill(cl.first, cover)
+                        cl.first.fill(cover[:2000])
+                        L(f"  ✓ Cover letter filled ({len(cover)} chars)")
+                        cl_filled = True
                         break
+                    except Exception as ce:
+                        L(f"  ✗ Cover letter fill error: {ce}")
+            if not cl_filled:
+                L("  Cover letter textarea not found (may not be required)")
+
+            # ── Fill all other fields via _fill_form ───────────────────────
+            L("Running _fill_form() for remaining fields…")
+            _fill_form_logged(page, profile, job, cover, username)
+
+            # ── Capture all visible input values pre-submit for audit ──────
+            try:
+                inputs_state = []
+                for inp in page.locator("input:visible, select:visible, textarea:visible").all()[:20]:
+                    try:
+                        label_txt = _get_label(page, inp) or inp.get_attribute("placeholder") or inp.get_attribute("name") or "?"
+                        val_txt   = inp.input_value() or ""
+                        if val_txt:
+                            inputs_state.append(f"{label_txt[:25]}={val_txt[:25]}")
                     except Exception:
                         pass
+                L(f"Pre-submit form state ({len(inputs_state)} filled fields):")
+                for s_ in inputs_state:
+                    L(f"  · {s_}")
+            except Exception:
+                pass
 
-            # Fill everything else
-            _fill_form(page, profile, job, cover)
+            # ── Find and click submit ──────────────────────────────────────
+            sub_selectors = [
+                "button[type=submit]:has-text('Submit')",
+                "button:has-text('Submit Application')",
+                "button:has-text('Submit my application')",
+                "input[type=submit][value*='Submit']",
+                "button[type=submit]",
+            ]
+            sub = None
+            for sub_sel in sub_selectors:
+                try:
+                    el = page.locator(sub_sel)
+                    if el.count() > 0 and el.first.is_visible():
+                        sub = el.first
+                        L(f"Submit button found: {sub_sel}")
+                        L(f"  Button text: {el.first.text_content()[:40]}")
+                        break
+                except Exception:
+                    pass
 
-            # Submit
-            sub = page.locator(
-                "button[type=submit]:has-text('Submit'),"
-                "button:has-text('Submit Application'),"
-                "input[type=submit][value*='Submit']"
-            )
-            if sub.count() > 0:
-                sub.first.click()
-                _jitter(3, 5)
-                # Check success
-                success = (
-                    any(page.locator(f"text={m}").count() > 0
-                        for m in ["Thank you", "Application received", "application complete"])
-                    or any(k in page.url.lower() for k in ("thank", "confirm", "success"))
-                )
+            if sub:
+                try:
+                    sub.click()
+                    L("Submit button clicked — waiting for response…")
+                    _jitter(4, 6)
+                    L(f"Post-submit URL: {page.url[:80]}")
+                    L(f"Post-submit title: {page.title()[:60]}")
+
+                    # Check page content for confirmation
+                    page_text = page.inner_text("body") if page.locator("body").count() > 0 else ""
+                    success_phrases = ["Thank you","thank you","Application received",
+                                       "application complete","We have received","Successfully submitted",
+                                       "application submitted","You applied","check your email"]
+                    url_success_keys = ["thank","confirm","success","applied","complete"]
+
+                    found_phrase = next((ph for ph in success_phrases if ph.lower() in page_text.lower()), None)
+                    found_url_key = next((k for k in url_success_keys if k in page.url.lower()), None)
+
+                    if found_phrase:
+                        L(f"  ✓ SUCCESS confirmed by page text: '{found_phrase}'")
+                        confirmed = True
+                    elif found_url_key:
+                        L(f"  ✓ SUCCESS confirmed by URL keyword: '{found_url_key}'")
+                        confirmed = True
+                    else:
+                        L(f"  ~ Cannot confirm success from page text or URL")
+                        L(f"  Page text snippet: {page_text[:200]}")
+                        confirmed = False
+
+                    browser.close()
+                    if confirmed:
+                        return {"success": True, "platform": "greenhouse", "manual": False}
+                    # Return success=True but flag as unconfirmed so UI shows warning
+                    return {"success": True, "platform": "greenhouse", "manual": False,
+                            "note": "Submitted but could not confirm — check your email"}
+
+                except Exception as click_err:
+                    L(f"  ✗ Submit click failed: {click_err}")
+                    browser.close()
+                    return _nope("greenhouse", f"Submit click error: {click_err}", job)
+            else:
+                # Log all buttons for debugging
+                try:
+                    btns = page.locator("button:visible").all()
+                    L(f"No submit button found. All visible buttons ({len(btns)}):")
+                    for btn in btns[:10]:
+                        try: L(f"  btn: '{btn.text_content()[:40]}'")
+                        except Exception: pass
+                except Exception:
+                    pass
                 browser.close()
-                if success:
-                    db.log(username, f"  ✓ Greenhouse submitted: {job.get('title')}")
-                    return {"success": True, "platform": "greenhouse", "manual": False}
-                # Even if we can't confirm, we tried
-                db.log(username, f"  ~ Greenhouse submitted (unconfirmed): {job.get('title')}")
-                return {"success": True, "platform": "greenhouse", "manual": False,
-                        "note": "Submitted — success unconfirmed"}
-
-            browser.close()
-            return _nope("greenhouse", "Submit button not found", job)
+                return _nope("greenhouse", "Submit button not found on page", job)
 
         except Exception as e:
+            import traceback
+            tb = traceback.format_exc()[-300:]
+            L(f"Playwright exception: {e}")
+            L(f"Traceback: {tb}")
             try: browser.close()
             except Exception: pass
             return _nope("greenhouse", str(e)[:200], job)
+
+
+def _fill_form_logged(page, profile: dict, job: dict, cover: str, username: str):
+    """Wrapper around _fill_form that logs what gets filled."""
+    def L(msg): db.log(username, f"  [FF] {msg}")
+    name_parts  = (profile.get("name","") or "").split()
+    resume_path = job.get("resume_path") or profile.get("base_resume_path","")
+    filled = []
+    skipped = 0
+
+    for inp in page.locator(
+        "input[type=text]:visible,"
+        "input[type=email]:visible,"
+        "input[type=tel]:visible,"
+        "input[type=number]:visible,"
+        "input[type=url]:visible,"
+        "input:not([type]):visible"
+    ).all():
+        try:
+            if not inp.is_visible() or inp.is_disabled():
+                continue
+            if (inp.input_value() or "").strip():
+                continue  # already filled
+
+            attrs    = " ".join(filter(None, [
+                inp.get_attribute("id") or "",
+                inp.get_attribute("name") or "",
+                inp.get_attribute("aria-label") or "",
+                inp.get_attribute("placeholder") or "",
+            ])).lower()
+            label    = _get_label(page, inp) or ""
+            combined = (attrs + " " + label).lower()
+            val      = _answer(label or combined, profile)
+
+            if val:
+                inp.fill(str(val))
+                filled.append(f"{(label or attrs)[:25]}={str(val)[:20]}")
+                _jitter(0.05, 0.15)
+            else:
+                skipped += 1
+        except Exception:
+            skipped += 1
+
+    L(f"Dynamic fill: {len(filled)} filled, {skipped} skipped/empty")
+    for f_ in filled:
+        L(f"  ✓ {f_}")
 
 
 # ── Lever ──────────────────────────────────────────────────────────────────────
