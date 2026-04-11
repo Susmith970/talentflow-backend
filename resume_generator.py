@@ -26,8 +26,15 @@ import re
 from datetime import datetime
 from pathlib import Path
 
-ROOT        = Path(__file__).parent.parent
-DATA_DIR    = ROOT / "data"
+# Use DATA_DIR env var (set in Railway) so paths match app.py
+import os as _os
+_data_env = _os.environ.get("DATA_DIR", "")
+if _data_env:
+    DATA_DIR = Path(_data_env) / "data"
+elif (Path(__file__).parent / "data").exists():
+    DATA_DIR = Path(__file__).parent / "data"        # flat Railway layout
+else:
+    DATA_DIR = Path(__file__).parent.parent / "data" # local nested layout
 RESUMES_DIR = DATA_DIR / "resumes"
 RESUMES_DIR.mkdir(parents=True, exist_ok=True)
 
