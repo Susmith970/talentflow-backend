@@ -174,37 +174,69 @@ def update_profile():
 
 @app.post("/api/profile/upload-resume")
 def upload_resume_to_profile():
+    """
+    Upload a base resume → extract ALL structured data with Claude → save to DB.
+    This runs ONCE on upload. After this, generate() reads from profile DB directly.
+    Never re-reads the PDF file.
+    """
     u = require_auth()
     if "file" not in request.files:
         return jsonify({"error": "No file"}), 400
     f   = request.files["file"]
     ext = Path(f.filename).suffix.lower()
-    if ext not in (".pdf",".docx",".txt"):
+    if ext not in (".pdf", ".docx", ".txt"):
         return jsonify({"error": "Use PDF, DOCX, or TXT"}), 400
 
     user_dir = DATA / u
     user_dir.mkdir(exist_ok=True)
-    tmp = user_dir / f"base_resume{ext}"
-    f.save(str(tmp))
+    saved_path = user_dir / f"base_resume{ext}"
+    f.save(str(saved_path))
 
     try:
         import resume_generator as rg
-        extracted = rg.extract_profile_from_file(str(tmp))
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        extracted = rg.extract_profile_from_file(str(saved_path))
+    except Exception as exc:
+        import traceback; traceback.print_exc()
+        return jsonify({"error": str(exc)}), 500
 
-    # Merge extracted fields into profile (don't overwrite auth/meta)
-    merge_keys = ["name","email","phone","linkedin","github","website",
-                  "location","title","summary","years_experience",
-                  "current_company","skills","ml_skills","tools",
-                  "experience","education","certifications",
-                  "publications","awards","languages","target_roles",
-                  "raw_resume_text","layout"]
-    updates = {k: extracted[k] for k in merge_keys if k in extracted}
-    updates["base_resume_path"] = str(tmp)
+    if extracted.get("error") and not extracted.get("raw_resume_text"):
+        return jsonify(extracted), 400
+
+    # Save every extracted field to the profile DB.
+    # generate() will read experience/projects/skills from here — never from the PDF.
+    ALL_MERGE_KEYS = [
+        "name", "email", "phone", "linkedin", "github", "website",
+        "location", "title", "summary", "years_experience", "current_company",
+        "target_roles",
+        "skills", "ml_skills", "tools",
+        "experience",   # list of {title, company, location, dates, bullets}
+        "education",    # list of {degree, school, location, dates, honors}
+        "projects",     # list of {name, technologies, dates, url, bullets}
+        "certifications",
+        "awards",
+        "raw_resume_text",
+    ]
+    updates = {k: extracted[k] for k in ALL_MERGE_KEYS if k in extracted}
+    updates["base_resume_path"] = str(saved_path)
+
+    # Log what we extracted so user can see it worked
+    n_jobs  = len(updates.get("experience") or [])
+    n_proj  = len(updates.get("projects") or [])
+    n_certs = len(updates.get("certifications") or [])
+
     db.update_profile(u, updates)
-    db.log(u, f"Resume uploaded: {f.filename}")
-    return jsonify({"ok": True, "extracted": updates})
+    db.log(u, f"Resume parsed: {f.filename} → {n_jobs} jobs, {n_proj} projects, {n_certs} certs")
+
+    return jsonify({
+        "ok":       True,
+        "summary": {
+            "jobs":         n_jobs,
+            "projects":     n_proj,
+            "certifications": n_certs,
+            "skills":       len(updates.get("skills") or []),
+        },
+        "extracted": updates,
+    })
 
 
 # ── Jobs ──────────────────────────────────────────────────────────────────────

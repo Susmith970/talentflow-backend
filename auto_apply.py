@@ -221,7 +221,8 @@ def _answer(question: str, profile: dict) -> str:
     # ── Salary ───────────────────────────────────────────────────────────────
     if any(x in q for x in ("salary expectation","expected salary","desired salary",
                               "salary requirement","compensation expectation","what salary",
-                              "minimum salary","base salary","target compensation")):
+                              "minimum salary","base salary","target compensation",
+                              "annual salary","current salary","salary","compensation")):
         sal = profile.get("salary_expectation","")
         if sal: return str(sal)
         yrs = int(profile.get("years_experience",3) or 3)

@@ -206,21 +206,16 @@ def tailor_for_job(profile: dict, job_description: str,
                    job_title: str, company: str) -> dict:
     """
     Two-pass tailoring:
-    Pass 1 — Analyse the JD, extract every keyword/skill/responsibility
-    Pass 2 — Rewrite every bullet using the analysis as a targeting document
-
-    Result: a resume where EVERY bullet directly maps to something in the JD.
-    Human reviewers and ATS systems both score this 85-95+.
+    Pass 1 — Deep JD analysis
+    Pass 2 — Rewrite with full creative freedom to write realistic, specific,
+              metrics-driven bullets that sound like a real engineer wrote them.
     """
     if not os.environ.get("ANTHROPIC_API_KEY") or not job_description.strip():
         return dict(profile)
 
-    # ── Pass 1: analyse the JD ────────────────────────────────────────────────
+    # ── Pass 1: Analyse the JD ───────────────────────────────────────────────
     print("  Analysing JD…")
-    analysis = _analyze_jd(job_title, company, job_description)
-    if not analysis:
-        analysis = {}
-
+    analysis      = _analyze_jd(job_title, company, job_description) or {}
     required      = analysis.get("required_skills", [])
     preferred     = analysis.get("preferred_skills", [])
     exact_kw      = analysis.get("exact_keywords", [])
@@ -231,42 +226,31 @@ def tailor_for_job(profile: dict, job_description: str,
     seniority     = analysis.get("seniority", "")
     industry_terms = analysis.get("industry_terms", [])
 
-    # Build the targeting document Claude will use in pass 2
-    targeting = f"""WHAT THIS JOB NEEDS (extracted from JD analysis):
+    targeting = f"""JOB ANALYSIS — {job_title} at {company}
 Domain: {domain} | Seniority: {seniority}
+Required skills: {", ".join(required[:20])}
+Preferred skills: {", ".join(preferred[:15])}
+Exact keywords to use: {", ".join(exact_kw[:30])}
+Industry terms: {", ".join(industry_terms[:10])}
+Day-to-day responsibilities:
+{chr(10).join(f"  - {r}" for r in responsibilities[:6])}
+Scale/metrics from JD: {", ".join(metrics[:8])}
+A winning resume must demonstrate:
+{chr(10).join(f"  {i+1}. {m}" for i, m in enumerate(must_show[:6]))}"""
 
-REQUIRED SKILLS (must appear in resume): {', '.join(required[:20])}
-PREFERRED SKILLS (include where honest): {', '.join(preferred[:15])}
-EXACT KEYWORDS TO USE: {', '.join(exact_kw[:30])}
-INDUSTRY TERMS: {', '.join(industry_terms[:10])}
-
-WHAT THIS PERSON WILL DO DAY-TO-DAY:
-{chr(10).join(f"- {r}" for r in responsibilities[:5])}
-
-SCALE/METRICS MENTIONED IN JD: {', '.join(metrics[:8])}
-
-A WINNING RESUME FOR THIS JOB MUST DEMONSTRATE:
-{chr(10).join(f"{i+1}. {m}" for i, m in enumerate(must_show[:5]))}"""
-
-    # ── Pass 2: rewrite the resume with surgical precision ────────────────────
+    # ── Build content payload ────────────────────────────────────────────────
     content = {
-        "summary":    profile.get("summary", ""),
+        "summary": profile.get("summary", ""),
+        "years_experience": profile.get("years_experience", 0),
         "experience": [
-            {
-                "title":    e.get("title", ""),
-                "company":  e.get("company", ""),
-                "location": e.get("location", ""),
-                "dates":    e.get("dates", ""),
-                "bullets":  e.get("bullets", []),
-            }
+            {"title": e.get("title",""), "company": e.get("company",""),
+             "location": e.get("location",""), "dates": e.get("dates",""),
+             "bullets": e.get("bullets",[])}
             for e in (profile.get("experience") or [])
         ],
         "projects": [
-            {
-                "name":         p.get("name", ""),
-                "technologies": p.get("technologies", ""),
-                "bullets":      p.get("bullets", []),
-            }
+            {"name": p.get("name",""), "technologies": p.get("technologies",""),
+             "bullets": p.get("bullets",[])}
             for p in (profile.get("projects") or [])
         ],
         "skills":    profile.get("skills", []),
@@ -274,100 +258,106 @@ A WINNING RESUME FOR THIS JOB MUST DEMONSTRATE:
         "tools":     profile.get("tools", []),
     }
 
-    print("  Rewriting bullets…")
+    # ── Pass 2: Rewrite with full creative freedom ───────────────────────────
+    print("  Rewriting resume…")
     raw = _call_claude(
-        prompt=(
-            f"You are a top-tier technical resume writer. Your job is to rewrite this "
-            f"candidate's resume so it scores 90+/100 for the specific job below.\n\n"
-            f"TARGET: {job_title} at {company}\n\n"
-            f"JOB DESCRIPTION (full):\n{job_description[:3000]}\n\n"
-            f"{targeting}\n\n"
-            f"CANDIDATE'S CURRENT RESUME CONTENT:\n{json.dumps(content, indent=2)}\n\n"
-            f"═══════════════════════════════════════════\n"
-            f"REWRITING INSTRUCTIONS — follow exactly:\n"
-            f"═══════════════════════════════════════════\n\n"
-            f"1. SUMMARY (4 sentences):\n"
-            f"   - Sentence 1: Who they are + years exp + domain (mirror JD language exactly)\n"
-            f"   - Sentence 2: Their strongest relevant skill + specific achievement with number\n"
-            f"   - Sentence 3: Mention 3-4 of the EXACT KEYWORDS from the JD\n"
-            f"   - Sentence 4: What they can deliver for THIS company/role specifically\n\n"
-            f"2. EXPERIENCE BULLETS — for EACH job:\n"
-            f"   - Rewrite EVERY bullet to directly address something in the JD\n"
-            f"   - Map bullets to KEY RESPONSIBILITIES: one bullet per major responsibility\n"
-            f"   - Formula: [Strong verb] + [what you did] + [JD keyword] + [metric/impact]\n"
-            f"   - EVERY bullet must contain at least one EXACT KEYWORD from the JD analysis\n"
-            f"   - If the original bullet has a number (%, $, x, TB, M/day), KEEP it — only add more\n"
-            f"   - If no number exists, add a realistic estimate: ~40%, 10x, 500K records, <200ms\n"
-            f"   - Most recent job gets 5-6 bullets. Earlier jobs get 3-4 bullets.\n"
-            f"   - Technology bridge: if JD says Azure and candidate has AWS — write:\n"
-            f"     'Built [X] on AWS (architecture directly portable to Azure [equivalent])' \n\n"
-            f"3. PROJECTS:\n"
-            f"   - Rewrite to highlight the aspect most relevant to the JD\n"
-            f"   - Add JD keywords into the technologies field if genuinely applicable\n"
-            f"   - At least one project bullet must mention a key JD skill\n\n"
-            f"4. SKILLS — restructure completely:\n"
-            f"   - Put REQUIRED SKILLS from JD first\n"
-            f"   - Add any JD skills the candidate has equivalent experience with\n"
-            f"   - Remove skills not relevant to this domain\n\n"
-            f"5. NEVER change: company names, job titles, employment dates, school names\n"
-            f"6. NEVER fabricate: only write what the candidate actually did (reframe, not invent)\n\n"
-            f"Return ONLY this JSON (no markdown, no commentary):\n"
-            f'{{"summary":"4-sentence targeted summary",'
-            f'"experience":[{{"title":"UNCHANGED","company":"UNCHANGED","location":"UNCHANGED","dates":"UNCHANGED","bullets":["rewritten bullet 1","rewritten bullet 2"]}}],'
-            f'"projects":[{{"name":"UNCHANGED","technologies":"may add JD-relevant tech","bullets":["rewritten"]}}],'
-            f'"skills":["JD-required first","then other relevant"],'
-            f'"ml_skills":["reordered and augmented"],'
-            f'"tools":["reordered and augmented"],'
-            f'"keywords_added":["every JD keyword now in this resume"]}}'
-        ),
         system=(
-            "You are a world-class technical resume writer who gets engineers hired at FAANG. "
-            "You write aggressive, specific, metrics-driven resumes where every single bullet "
-            "directly maps to a job requirement. You never waste a bullet on something the JD "
-            "doesn't care about. Return ONLY valid JSON."
+            "You are a world-class technical resume writer who gets senior engineers "
+            "hired at top companies. You write authentic, specific, metrics-driven resumes "
+            "that read like a real engineer wrote them — not generic filler. "
+            "Every bullet tells a concrete story: what was the problem, what did they build, "
+            "what was the measurable outcome. Return ONLY valid JSON."
         ),
+        prompt=f"""You are tailoring {profile.get("name","this candidate")}\'s resume for:
+ROLE: {job_title} at {company}
+
+FULL JOB DESCRIPTION:
+{job_description[:3500]}
+
+{targeting}
+
+CANDIDATE\'S CURRENT RESUME:
+{json.dumps(content, indent=2)[:4000]}
+
+════════════════════════════════════════════
+YOUR TASK — REWRITE WITH FULL CREATIVE FREEDOM
+════════════════════════════════════════════
+
+You have FULL CREATIVE FREEDOM to write compelling, realistic bullets.
+Think: what would a top engineer in this exact role actually have done?
+Write bullets that sound like a real senior person wrote them — specific,
+technical, and with real business impact. You can:
+
+✓ Infer realistic scenarios from the candidate\'s tech stack + role
+✓ Write NEW bullets that plausibly describe what someone with their background
+  would have done at that company (e.g. "Led migration of X to Y, reducing Z by N%")
+✓ Add realistic metrics where none exist (use hedged language: "~40%", "over 500K",
+  "reduced from ~8hrs to <30min")
+✓ Connect their AWS experience to Azure JD requirements naturally
+✓ Write the summary from scratch — make it punchy and role-specific
+
+RULES:
+• NEVER change company names, job titles, employment dates, or school names
+• NEVER claim a degree or certification they don\'t have
+• Keep bullets technically accurate to their stack (don\'t invent unrelated tech)
+• Most recent job: 5-6 bullets. Each earlier job: 3-4 bullets.
+• Every bullet: [Power verb] + [specific technical action] + [JD keyword] + [metric]
+• Summary: 3-4 sentences, mirrors JD language, leads with years + domain
+
+BULLET FORMULA EXAMPLES:
+• "Engineered a real-time Kafka ingestion layer processing 2M+ events/day,
+  reducing data latency from ~4hrs to under 90 seconds for downstream ML pipelines"
+• "Automated Terraform-based provisioning of EKS clusters, cutting new environment
+  setup from 3 days to ~45 minutes and eliminating 100% of manual config drift"
+• "Built dbt transformation models across 40+ tables, replacing ad-hoc SQL and
+  reducing analyst query time by ~65% while improving data lineage visibility"
+
+Return ONLY this JSON (no markdown, no commentary):
+{{"summary":"3-4 sentence punchy targeted summary",
+"experience":[{{"title":"UNCHANGED","company":"UNCHANGED","location":"UNCHANGED","dates":"UNCHANGED","bullets":["compelling bullet 1","compelling bullet 2","compelling bullet 3"]}}],
+"projects":[{{"name":"UNCHANGED","technologies":"updated tech stack","bullets":["rewritten project bullet"]}}],
+"skills":["required skills first"],"ml_skills":["relevant ml skills"],"tools":["relevant tools"],
+"keywords_added":["every JD keyword now woven into resume"]}}""",
         max_tokens=4096,
     )
 
     tailored = _parse_json_response(raw)
 
     if not isinstance(tailored, dict) or not tailored.get("experience"):
-        print("  Warning: tailoring returned bad JSON — using original")
+        print("  Warning: tailoring returned bad JSON — using original profile")
         return dict(profile)
 
-    # Merge: always lock company/title/dates to originals
-    result = dict(profile)
+    # Merge — lock factual fields, take Claude\'s creative bullets
+    result   = dict(profile)
+    orig_exp = profile.get("experience") or []
+    orig_prj = profile.get("projects") or []
 
     if tailored.get("summary"):
         result["summary"] = tailored["summary"]
 
-    if tailored.get("experience"):
-        safe_exp = []
-        orig_exp = profile.get("experience") or []
-        for i, exp in enumerate(tailored["experience"]):
-            orig = orig_exp[i] if i < len(orig_exp) else {}
-            safe_exp.append({
-                "title":    orig.get("title",    exp.get("title", "")),
-                "company":  orig.get("company",  exp.get("company", "")),
-                "location": orig.get("location", exp.get("location", "")),
-                "dates":    orig.get("dates",    exp.get("dates", "")),
-                "bullets":  exp.get("bullets",   orig.get("bullets", [])),
-            })
-        result["experience"] = safe_exp
+    safe_exp = []
+    for i, exp in enumerate(tailored.get("experience", [])):
+        orig = orig_exp[i] if i < len(orig_exp) else {}
+        safe_exp.append({
+            "title":    orig.get("title",    exp.get("title", "")),
+            "company":  orig.get("company",  exp.get("company", "")),
+            "location": orig.get("location", exp.get("location", "")),
+            "dates":    orig.get("dates",    exp.get("dates", "")),
+            "bullets":  exp.get("bullets",   orig.get("bullets", [])),
+        })
+    result["experience"] = safe_exp
 
-    if tailored.get("projects"):
-        safe_proj = []
-        orig_proj = profile.get("projects") or []
-        for i, proj in enumerate(tailored["projects"]):
-            orig = orig_proj[i] if i < len(orig_proj) else {}
-            safe_proj.append({
-                "name":         orig.get("name",         proj.get("name", "")),
-                "technologies": proj.get("technologies", orig.get("technologies", "")),
-                "dates":        orig.get("dates",        proj.get("dates", "")),
-                "url":          orig.get("url",          proj.get("url", "")),
-                "bullets":      proj.get("bullets",      orig.get("bullets", [])),
-            })
-        result["projects"] = safe_proj
+    safe_prj = []
+    for i, proj in enumerate(tailored.get("projects", [])):
+        orig = orig_prj[i] if i < len(orig_prj) else {}
+        safe_prj.append({
+            "name":         orig.get("name",         proj.get("name", "")),
+            "technologies": proj.get("technologies", orig.get("technologies", "")),
+            "dates":        orig.get("dates",        proj.get("dates", "")),
+            "url":          orig.get("url",          proj.get("url", "")),
+            "bullets":      proj.get("bullets",      orig.get("bullets", [])),
+        })
+    result["projects"] = safe_prj
 
     for key in ("skills", "ml_skills", "tools"):
         if tailored.get(key):
@@ -375,6 +365,7 @@ A WINNING RESUME FOR THIS JOB MUST DEMONSTRATE:
 
     result["keywords_added"] = tailored.get("keywords_added", [])
     return result
+
 
 # ---------------------------------------------------------------------------
 # PDF renderer — Jake's Resume template
@@ -728,138 +719,160 @@ def render_pdf(profile: dict, output_filename: str) -> str:
 # Extract profile from uploaded base resume (PDF / DOCX / TXT)
 # Called by app.py /api/profile/upload-resume
 # ---------------------------------------------------------------------------
+
 def extract_profile_from_file(file_path: str) -> dict:
     """
-    Parse a resume file and extract structured profile data using Claude.
-    Falls back to basic text extraction if no API key.
-    """
-    path = Path(file_path)
-    ext  = path.suffix.lower()
+    Extract full structured profile from a resume file using Claude.
+    Called ONCE on upload — result saved to DB, never re-read from file.
 
-    # ── Read raw text ────────────────────────────────────────────────────────
-    raw_text = ""
+    Strategy: split long resumes into two chunks, extract from each,
+    then merge so no job/project/skill is ever truncated away.
+    """
+    fpath = Path(file_path)
+    ext   = fpath.suffix.lower()
+
+    # ── 1. Read raw text ─────────────────────────────────────────────────────
+    raw = ""
     try:
         if ext == ".pdf":
-            try:
-                from pdfminer.high_level import extract_text as pdf_extract
-                raw_text = pdf_extract(str(path))
-            except ImportError:
-                raw_text = path.read_bytes().decode("utf-8", errors="replace")
+            from pdfminer.high_level import extract_text as _pdf
+            raw = _pdf(str(fpath))
         elif ext == ".docx":
-            try:
-                import zipfile, xml.etree.ElementTree as ET
-                with zipfile.ZipFile(str(path)) as z:
-                    xml_content = z.read("word/document.xml")
-                tree = ET.fromstring(xml_content)
-                ns   = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
-                raw_text = " ".join(
-                    t.text for t in tree.iter("{http://schemas.openxmlformats.org/wordprocessingml/2006/main}t")
-                    if t.text
-                )
-            except Exception:
-                raw_text = path.read_text(errors="replace")
+            import zipfile, xml.etree.ElementTree as ET
+            with zipfile.ZipFile(str(fpath)) as z:
+                xml_bytes = z.read("word/document.xml")
+            ns_t = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}t"
+            raw  = " ".join(n.text for n in ET.fromstring(xml_bytes).iter(ns_t) if n.text)
         else:
-            raw_text = path.read_text(errors="replace")
-    except Exception as e:
-        return {"error": f"Could not read file: {e}"}
+            raw = fpath.read_text(errors="replace")
+    except Exception as exc:
+        return {"error": f"Cannot read file: {exc}"}
 
-    if not raw_text.strip():
-        return {"error": "Could not extract text from file"}
+    raw = raw.strip()
+    if not raw:
+        return {"error": "No text could be extracted from the file"}
 
-    # ── If no API key, return raw text only ─────────────────────────────────
+    # Always store raw text so profile UI can display it
+    result_base = {"raw_resume_text": raw[:15000]}
+
     if not os.environ.get("ANTHROPIC_API_KEY"):
-        return {"raw_resume_text": raw_text[:5000]}
+        return result_base
 
-    # ── Use Claude to extract structured data ────────────────────────────────
-    raw = _call_claude(
-        system=(
-            "You are a resume parser. Extract structured data from the resume text. "
-            "Return ONLY valid JSON with no markdown fences. Be thorough and accurate."
-        ),
-        prompt=(
-            f"Parse this resume and extract ALL information into this exact JSON structure.\n"
-            f"Extract every job, every bullet point, every skill, every project — nothing missing.\n\n"
-            f"RESUME TEXT:\n{raw_text[:6000]}\n\n"
-            f"Return this JSON (fill every field you can find, leave empty string/array if not found):\n"
-            f"{{\n"
-            f'  "name": "Full Name",\n'
-            f'  "email": "email@example.com",\n'
-            f'  "phone": "+1-xxx-xxx-xxxx",\n'
-            f'  "location": "City, State",\n'
-            f'  "linkedin": "linkedin.com/in/username",\n'
-            f'  "github": "github.com/username",\n'
-            f'  "website": "",\n'
-            f'  "title": "Current Job Title",\n'
-            f'  "summary": "Professional summary paragraph",\n'
-            f'  "years_experience": 5,\n'
-            f'  "current_company": "Most recent company name",\n'
-            f'  "target_roles": ["Role from resume"],\n'
-            f'  "experience": [\n'
-            f'    {{\n'
-            f'      "title": "Job Title",\n'
-            f'      "company": "Company Name",\n'
-            f'      "location": "City, State",\n'
-            f'      "dates": "Mon YYYY - Mon YYYY",\n'
-            f'      "bullets": ["Achievement bullet 1", "Achievement bullet 2"]\n'
-            f'    }}\n'
-            f'  ],\n'
-            f'  "education": [\n'
-            f'    {{\n'
-            f'      "degree": "Degree Name",\n'
-            f'      "school": "School Name",\n'
-            f'      "location": "City, State",\n'
-            f'      "dates": "Mon YYYY - Mon YYYY",\n'
-            f'      "gpa": "",\n'
-            f'      "honors": "Awards/honors if any"\n'
-            f'    }}\n'
-            f'  ],\n'
-            f'  "projects": [\n'
-            f'    {{\n'
-            f'      "name": "Project Name",\n'
-            f'      "technologies": "Tech1, Tech2",\n'
-            f'      "dates": "",\n'
-            f'      "url": "",\n'
-            f'      "bullets": ["What it does and impact"]\n'
-            f'    }}\n'
-            f'  ],\n'
-            f'  "skills": ["Python", "SQL"],\n'
-            f'  "ml_skills": ["PyTorch", "PySpark"],\n'
-            f'  "tools": ["AWS", "Docker"],\n'
-            f'  "certifications": ["Cert 1"],\n'
-            f'  "awards": []\n'
-            f"}}"
-        ),
-        max_tokens=4096,
+    # ── 2. Build extraction prompt ────────────────────────────────────────────
+    SCHEMA = (
+        '{"name":"","email":"","phone":"","location":"","linkedin":"","github":"",'
+        '"website":"","title":"","summary":"","years_experience":0,"current_company":"",'
+        '"target_roles":[],'
+        '"experience":['
+        '{"title":"","company":"","location":"","dates":"","bullets":[]}'
+        '],'
+        '"education":['
+        '{"degree":"","school":"","location":"","dates":"","gpa":"","honors":""}'
+        '],'
+        '"projects":['
+        '{"name":"","technologies":"","dates":"","url":"","bullets":[]}'
+        '],'
+        '"skills":[],"ml_skills":[],"tools":[],"certifications":[],"awards":[]}'
     )
 
-    extracted = _parse_json_response(raw)
+    SYSTEM = (
+        "You are an expert resume parser. Extract ALL information with 100% recall — "
+        "every job, every bullet, every project, every skill. "
+        "Return ONLY valid JSON matching the schema exactly. No markdown fences."
+    )
 
-    if not extracted or not isinstance(extracted, dict):
-        return {"raw_resume_text": raw_text[:5000], "error": "Could not parse resume structure"}
+    def _extract_chunk(chunk: str, hint: str = "") -> dict:
+        prompt = (
+            f"Parse this resume{hint} and extract ALL information into this exact JSON schema.\n"
+            f"CRITICAL: Extract EVERY job with ALL bullets. Extract EVERY project. "
+            f"Do not summarise or skip anything.\n\n"
+            f"RESUME TEXT:\n{chunk}\n\n"
+            f"Return this JSON structure (fill every field you find):\n{SCHEMA}"
+        )
+        raw_resp = _call_claude(prompt, SYSTEM, max_tokens=4096)
+        return _parse_json_response(raw_resp)
 
-    # Validate and clean extracted data
-    # Ensure experience bullets are actual lists
-    for exp in (extracted.get("experience") or []):
-        if isinstance(exp.get("bullets"), str):
-            exp["bullets"] = [b.strip() for b in exp["bullets"].split("\n") if b.strip()]
+    # ── 3. Single call if resume fits; two calls if long ─────────────────────
+    CHUNK = 7500   # safe limit — well below Claude's context, gives full jobs
+    if len(raw) <= CHUNK:
+        data = _extract_chunk(raw)
+    else:
+        # Split at a natural boundary near the midpoint
+        mid   = len(raw) // 2
+        split = raw.rfind("\n\n", mid - 500, mid + 500)
+        if split == -1:
+            split = mid
+        first_half  = raw[:split]
+        second_half = raw[split:]
 
-    # Calculate years_experience from dates if not extracted
-    if not extracted.get("years_experience") and extracted.get("experience"):
-        import datetime
-        total_months = 0
-        current_year = datetime.datetime.now().year
-        for exp in extracted.get("experience", []):
-            dates = str(exp.get("dates", ""))
-            years = re.findall(r"(\d{4})", dates)
+        d1 = _extract_chunk(first_half,  " (PART 1 of 2 — header + first jobs)")
+        d2 = _extract_chunk(second_half, " (PART 2 of 2 — remaining jobs, projects, skills, certs)")
+
+        # Merge: take header/contact from part 1, merge lists from both
+        data = d1 if isinstance(d1, dict) else {}
+        if isinstance(d2, dict):
+            # Append jobs from part 2 that aren't already in part 1
+            existing_cos = {e.get("company","").lower() for e in (data.get("experience") or [])}
+            for exp in (d2.get("experience") or []):
+                if exp.get("company","").lower() not in existing_cos:
+                    data.setdefault("experience", []).append(exp)
+                    existing_cos.add(exp.get("company","").lower())
+
+            # Append projects from part 2
+            existing_proj = {p.get("name","").lower() for p in (data.get("projects") or [])}
+            for proj in (d2.get("projects") or []):
+                if proj.get("name","").lower() not in existing_proj:
+                    data.setdefault("projects", []).append(proj)
+                    existing_proj.add(proj.get("name","").lower())
+
+            # Merge skills (union, dedup)
+            for key in ("skills", "ml_skills", "tools", "certifications", "awards"):
+                combined = list(dict.fromkeys(
+                    (data.get(key) or []) + (d2.get(key) or [])
+                ))
+                if combined:
+                    data[key] = combined
+
+            # Fill blank contact fields from part 2 if part 1 missed them
+            for field in ("name","email","phone","location","linkedin","github",
+                          "website","title","summary","current_company"):
+                if not data.get(field) and d2.get(field):
+                    data[field] = d2[field]
+
+            # Education — merge
+            existing_schools = {e.get("school","").lower() for e in (data.get("education") or [])}
+            for edu in (d2.get("education") or []):
+                if edu.get("school","").lower() not in existing_schools:
+                    data.setdefault("education", []).append(edu)
+
+    if not isinstance(data, dict):
+        return result_base
+
+    # ── 4. Post-process ───────────────────────────────────────────────────────
+    # Normalise bullet strings → lists
+    for section in ("experience", "projects"):
+        for item in (data.get(section) or []):
+            if isinstance(item.get("bullets"), str):
+                item["bullets"] = [b.strip("• ").strip()
+                                   for b in re.split(r"[\n•]", item["bullets"])
+                                   if b.strip("• ").strip()]
+
+    # Calculate years_experience from date spans if Claude didn't extract it
+    if not data.get("years_experience") and data.get("experience"):
+        total = 0
+        cy    = datetime.now().year
+        for exp in data["experience"]:
+            years = re.findall(r"(\d{4})", str(exp.get("dates", "")))
             if len(years) >= 2:
-                total_months += (int(years[1]) - int(years[0])) * 12
-            elif len(years) == 1:
-                total_months += (current_year - int(years[0])) * 12
-        if total_months > 0:
-            extracted["years_experience"] = max(1, round(total_months / 12))
+                total += (int(years[1]) - int(years[0])) * 12
+            elif years:
+                total += (cy - int(years[0])) * 12
+        if total > 0:
+            data["years_experience"] = max(1, round(total / 12))
 
-    extracted["raw_resume_text"] = raw_text[:5000]
-    return extracted
+    # Add raw text
+    data["raw_resume_text"] = raw[:15000]
+    return data
 
 
 # ---------------------------------------------------------------------------

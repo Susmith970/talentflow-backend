@@ -168,8 +168,10 @@ def is_us_location(loc: str) -> bool:
     non_us = ["india","uk ","united kingdom","canada","australia","germany",
                "france","spain","italy","netherlands","brazil","mexico",
                "singapore","japan","china","europe","latam","apac","emea",
+               "worldwide","global","international","anywhere in the world",
                "bangalore","mumbai","hyderabad","delhi","london","berlin",
-               "paris","toronto","sydney","amsterdam","dublin","stockholm"]
+               "paris","toronto","sydney","amsterdam","dublin","stockholm",
+               "tel aviv","dubai","uae","pakistan","philippines","nigeria"]
     for region in non_us:
         if region in l:
             return False
