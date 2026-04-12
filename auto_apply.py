@@ -196,7 +196,17 @@ def _answer(question: str, profile: dict) -> str:
         if gh and not gh.startswith("http"): gh = "https://github.com/" + gh.lstrip("/")
         return gh
     if any(x in q for x in ("website","portfolio","personal site","personal url")):
-        return profile.get("portfolio_url","") or profile.get("website","") or profile.get("github","")
+        _bad = ("railway","vercel","heroku","render.com","localhost","ngrok")
+        ws   = profile.get("portfolio_url","") or profile.get("website","")
+        gh   = profile.get("github","")
+        if ws and any(b in ws.lower() for b in _bad): ws = ""
+        if ws: return ws
+        if gh:
+            gh = gh.strip().lstrip("/")
+            if "github.com" in gh:
+                return "https://" + gh if not gh.startswith("http") else gh
+            return "https://github.com/" + gh
+        return ""
 
     # ── Current employment ────────────────────────────────────────────────────
     if any(x in q for x in ("current company","current employer","where do you work",
@@ -586,7 +596,11 @@ def _fill_form(page, profile: dict, job: dict, cover: str) -> bool:
                 gh = profile.get("github","")
                 val = ("https://github.com/" + gh.lstrip("/")) if gh and not gh.startswith("http") else gh
             elif any(x in combined for x in ("website","portfolio","personal url","personal site")):
-                val = profile.get("portfolio_url","") or profile.get("website","") or profile.get("github","")
+                _bad = ("railway","vercel","heroku","render.com","localhost")
+                ws = profile.get("portfolio_url","") or profile.get("website","")
+                gh = profile.get("github","")
+                if ws and any(b in ws.lower() for b in _bad): ws = ""
+                val = ws or (("https://github.com/"+gh.lstrip("/")) if gh and not gh.startswith("http") else gh) or ""
 
             # ── Company ───────────────────────────────────────────────────
             elif any(x in combined for x in ("current company","current employer","company name","employer","organization")):
@@ -1308,21 +1322,44 @@ def _greenhouse_playwright(job: dict, profile: dict, username: str,
             else:
                 L(f"  ✗ Resume file missing or path invalid: {resume_path}")
 
-            # ── Cover letter ───────────────────────────────────────────────
+            # ── Cover letter ─────────────────────────────────────────────────
+            # IMPORTANT: some forms use #cover_letter for a FILE input not textarea.
+            # Only fill if the element is actually a textarea or text input.
             cl_filled = False
-            for cl_sel in ("textarea[id*=cover]", "#cover_letter", "textarea[name*=cover]",
-                           "textarea[placeholder*=cover i]"):
+            cl_selectors = [
+                "textarea[id*=cover]",
+                "textarea[name*=cover]",
+                "textarea[placeholder*=cover i]",
+                "textarea[aria-label*=cover i]",
+                # #cover_letter only if it is NOT a file input
+            ]
+            # Also check #cover_letter explicitly but verify it's not file type
+            for cl_sel in cl_selectors:
                 cl = page.locator(cl_sel)
                 if cl.count() > 0:
                     try:
                         cl.first.fill(cover[:2000])
-                        L(f"  ✓ Cover letter filled ({len(cover)} chars)")
+                        L(f"  ✓ Cover letter filled via {cl_sel} ({len(cover)} chars)")
                         cl_filled = True
                         break
                     except Exception as ce:
-                        L(f"  ✗ Cover letter fill error: {ce}")
+                        L(f"  ✗ Cover letter fill error ({cl_sel}): {ce}")
+            # Try #cover_letter only if it's not a file input
             if not cl_filled:
-                L("  Cover letter textarea not found (may not be required)")
+                cl = page.locator("#cover_letter")
+                if cl.count() > 0:
+                    el_type = cl.first.get_attribute("type") or "textarea"
+                    if el_type.lower() != "file":
+                        try:
+                            cl.first.fill(cover[:2000])
+                            L(f"  ✓ Cover letter filled via #cover_letter ({len(cover)} chars)")
+                            cl_filled = True
+                        except Exception as ce:
+                            L(f"  ✗ Cover letter fill error (#cover_letter): {ce}")
+                    else:
+                        L(f"  ℹ #cover_letter is a file input — skipping text fill")
+            if not cl_filled:
+                L("  Cover letter textarea not found (not required or not visible)")
 
             # ── Fill all other fields via _fill_form ───────────────────────
             L("Running _fill_form() for remaining fields…")
@@ -1330,18 +1367,28 @@ def _greenhouse_playwright(job: dict, profile: dict, username: str,
 
             # ── Capture all visible input values pre-submit for audit ──────
             try:
-                inputs_state = []
-                for inp in page.locator("input:visible, select:visible, textarea:visible").all()[:20]:
+                filled_state = []
+                empty_required = []
+                for inp in page.locator("input:visible, select:visible, textarea:visible").all()[:30]:
                     try:
-                        label_txt = _get_label(page, inp) or inp.get_attribute("placeholder") or inp.get_attribute("name") or "?"
+                        itype = inp.get_attribute("type") or ""
+                        if itype == "file": continue
+                        label_txt = _get_label(page, inp) or inp.get_attribute("placeholder") or inp.get_attribute("name") or inp.get_attribute("aria-label") or "?"
                         val_txt   = inp.input_value() or ""
+                        is_req    = inp.get_attribute("required") is not None or inp.get_attribute("aria-required") == "true"
                         if val_txt:
-                            inputs_state.append(f"{label_txt[:25]}={val_txt[:25]}")
+                            filled_state.append(f"{label_txt[:25]}={val_txt[:25]}")
+                        elif is_req:
+                            empty_required.append(label_txt[:40])
                     except Exception:
                         pass
-                L(f"Pre-submit form state ({len(inputs_state)} filled fields):")
-                for s_ in inputs_state:
+                L(f"Pre-submit form state ({len(filled_state)} filled fields):")
+                for s_ in filled_state:
                     L(f"  · {s_}")
+                if empty_required:
+                    L(f"  ⚠ Required fields still EMPTY ({len(empty_required)}) — form may not submit:")
+                    for er in empty_required:
+                        L(f"    ✗ {er}")
             except Exception:
                 pass
 
@@ -1372,6 +1419,30 @@ def _greenhouse_playwright(job: dict, profile: dict, username: str,
                     _jitter(4, 6)
                     L(f"Post-submit URL: {page.url[:80]}")
                     L(f"Post-submit title: {page.title()[:60]}")
+
+                    # Scroll to top to reveal any validation errors
+                    try:
+                        page.evaluate("window.scrollTo(0,0)")
+                        _jitter(1, 1.5)
+                    except Exception:
+                        pass
+
+                    # Check for validation errors FIRST (form didn't submit)
+                    error_texts = []
+                    for err_sel in (".error:visible", ".field-error:visible",
+                                    "[class*=error]:visible", "[aria-invalid=true]:visible",
+                                    ".alert-error:visible", "#error_explanation:visible"):
+                        try:
+                            errs = page.locator(err_sel).all()
+                            for e in errs[:5]:
+                                t = (e.inner_text() or "").strip()
+                                if t: error_texts.append(t[:80])
+                        except Exception:
+                            pass
+                    if error_texts:
+                        L(f"  ✗ VALIDATION ERRORS — form was NOT submitted:")
+                        for et in error_texts:
+                            L(f"    → {et}")
 
                     # Check page content for confirmation
                     page_text = page.inner_text("body") if page.locator("body").count() > 0 else ""
@@ -1436,6 +1507,7 @@ def _fill_form_logged(page, profile: dict, job: dict, cover: str, username: str)
     filled = []
     skipped = 0
 
+    # Text inputs
     for inp in page.locator(
         "input[type=text]:visible,"
         "input[type=email]:visible,"
@@ -1445,11 +1517,8 @@ def _fill_form_logged(page, profile: dict, job: dict, cover: str, username: str)
         "input:not([type]):visible"
     ).all():
         try:
-            if not inp.is_visible() or inp.is_disabled():
-                continue
-            if (inp.input_value() or "").strip():
-                continue  # already filled
-
+            if not inp.is_visible() or inp.is_disabled(): continue
+            if (inp.input_value() or "").strip(): continue
             attrs    = " ".join(filter(None, [
                 inp.get_attribute("id") or "",
                 inp.get_attribute("name") or "",
@@ -1458,14 +1527,40 @@ def _fill_form_logged(page, profile: dict, job: dict, cover: str, username: str)
             ])).lower()
             label    = _get_label(page, inp) or ""
             combined = (attrs + " " + label).lower()
-            val      = _answer(label or combined, profile)
-
+            # Skip website if it would fill a deployment URL
+            val = _answer(label or combined, profile)
+            if val and any(bad in str(val).lower() for bad in ("railway","vercel","heroku","render.com")):
+                val = ""  # don't fill bad URLs
             if val:
                 inp.fill(str(val))
                 filled.append(f"{(label or attrs)[:25]}={str(val)[:20]}")
                 _jitter(0.05, 0.15)
             else:
                 skipped += 1
+        except Exception:
+            skipped += 1
+
+    # Select dropdowns — critical for auth status, degree, etc.
+    for sel_el in page.locator("select:visible").all():
+        try:
+            if not sel_el.is_visible() or sel_el.is_disabled(): continue
+            if (sel_el.input_value() or "").strip(): continue
+            label    = _get_label(page, sel_el) or sel_el.get_attribute("name") or sel_el.get_attribute("id") or ""
+            combined = label.lower()
+            val      = _answer(combined, profile)
+            if val:
+                # Try to select by label text first, then by value
+                opts = sel_el.locator("option").all()
+                matched = None
+                for opt in opts:
+                    opt_text = (opt.inner_text() or "").strip()
+                    if val.lower() in opt_text.lower() or opt_text.lower() in val.lower():
+                        matched = opt_text
+                        break
+                if matched:
+                    sel_el.select_option(label=matched)
+                    filled.append(f"{label[:25]}(select)={matched[:20]}")
+                    _jitter(0.05, 0.15)
         except Exception:
             skipped += 1
 
