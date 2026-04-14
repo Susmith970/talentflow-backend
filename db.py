@@ -22,8 +22,19 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 ROOT = DATA_DIR.parent
 
 # ── Postgres detection ─────────────────────────────────────────────────────────
+# Railway injects PG* vars automatically when a Postgres service is linked.
+# DATABASE_URL may need manual linking but PG* vars are always present.
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
-USE_POSTGRES  = bool(DATABASE_URL)
+if not DATABASE_URL:
+    _pg_host = os.environ.get("PGHOST", "")
+    _pg_port = os.environ.get("PGPORT", "5432")
+    _pg_user = os.environ.get("PGUSER", "")
+    _pg_pass = os.environ.get("PGPASSWORD", "")
+    _pg_db   = os.environ.get("PGDATABASE", "")
+    if _pg_host and _pg_user and _pg_db:
+        DATABASE_URL = f"postgresql://{_pg_user}:{_pg_pass}@{_pg_host}:{_pg_port}/{_pg_db}"
+        print(f"  [db] Built DATABASE_URL from PG* env vars (host={_pg_host})")
+USE_POSTGRES = bool(DATABASE_URL)
 
 _pg_lock = threading.Lock()
 _pg_conn  = None
@@ -82,10 +93,13 @@ if USE_POSTGRES:
         _init_pg()
         print("  [db] Connected to PostgreSQL — profile + jobs persist across redeploys")
     except Exception as _pg_err:
-        print(f"  [db] PostgreSQL failed ({_pg_err}) — falling back to JSON files")
+        print(f"  [db] PostgreSQL FAILED: {_pg_err}")
+        print(f"  [db] DATABASE_URL present: {bool(DATABASE_URL)}")
+        print(f"  [db] Falling back to JSON files at {DATA_DIR}")
         USE_POSTGRES = False
 else:
-    print(f"  [db] JSON file storage at {DATA_DIR}")
+    print(f"  [db] No DATABASE_URL or PG* vars found — using JSON files at {DATA_DIR}")
+    print(f"  [db] Set DATABASE_URL in Railway to enable persistence")
 
 # ── JSON file helpers ──────────────────────────────────────────────────────────
 _flocks: dict[str, threading.Lock] = {}
