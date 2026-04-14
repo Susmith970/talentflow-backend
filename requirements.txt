@@ -6,4 +6,3 @@ pdfminer.six>=20231228
 playwright>=1.40.0
 python-dotenv>=1.0.0
 gunicorn>=21.0.0
-psycopg2-binary>=2.9.0

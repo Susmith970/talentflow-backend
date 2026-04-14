@@ -309,6 +309,7 @@ def start_scrape():
     body    = request.json or {}
     roles   = body.get("roles") or profile.get("target_roles", ["Software Engineer"])
     work    = body.get("work_preference") or profile.get("work_preference","Any")
+    emp     = body.get("employment_type_pref") or profile.get("employment_type_pref","Any")
 
     if _scrape_progress.get(u,{}).get("running"):
         return jsonify({"error": "Scrape already running"}), 409
@@ -323,7 +324,7 @@ def start_scrape():
 
         try:
             import scraper
-            new_jobs = scraper.run(roles, work, progress_cb=progress)
+            new_jobs = scraper.run(roles, work, emp_type=emp, progress_cb=progress)
 
             # AI-score if API key set
             api_key = os.environ.get("ANTHROPIC_API_KEY","")
@@ -489,10 +490,11 @@ def pipeline_start():
 
     body    = request.json or {}
     options = {
-        "score_threshold": body.get("score_threshold", 60),
-        "max_apply":       body.get("max_apply", 50),
-        "roles":           body.get("roles") or profile.get("target_roles", []),
-        "work_preference": body.get("work_preference") or profile.get("work_preference", "Any"),
+        "score_threshold":    body.get("score_threshold", 60),
+        "max_apply":          body.get("max_apply", 50),
+        "roles":              body.get("roles") or profile.get("target_roles", []),
+        "work_preference":    body.get("work_preference") or profile.get("work_preference", "Any"),
+        "employment_type_pref": body.get("employment_type_pref") or profile.get("employment_type_pref", "Any"),
     }
 
     started = pipeline.start(u, profile, options)

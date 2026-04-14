@@ -187,9 +187,19 @@ def is_us_location(loc: str) -> bool:
 def make_job(uid, title, company, loc, source, url, posted, desc,
              salary="", tags=None, easy_apply=False, apply_url=None):
     _au = apply_url or url
+    # Detect employment type from title and description
+    _emp_text = (title + " " + desc).lower()
+    if any(w in _emp_text for w in ("contract","contractor","contract-to-hire","c2h","c2c","corp-to-corp","freelance","consultant")):
+        _emp_type = "Contract"
+    elif any(w in _emp_text for w in ("part-time","part time","parttime")):
+        _emp_type = "Part-time"
+    else:
+        _emp_type = "Full-time"  # default assumption
+
     return {
         "id": uid, "title": title.strip(), "company": company.strip(),
         "location": (loc or "").strip(), "work_type": work_type(loc),
+        "employment_type": _emp_type,
         "source": source, "url": url, "apply_url": _au,
         "posted": (posted or "Today")[:20],
         "description": clean(desc)[:2000],
@@ -581,23 +591,27 @@ def scrape_yc(roles):
 
 # ─── Source 10: Greenhouse public boards ─────────────────────────────────────
 
+# Greenhouse boards — verified working April 2026
+# API endpoint: https://boards-api.greenhouse.io/v1/boards/{board}/jobs
+# Many companies switched to job-boards.greenhouse.io but API still works for these
 GREENHOUSE_BOARDS = [
-    # Verified working as of 2025 (404s removed)
-    "stripe", "figma", "vercel", "scaleai", "anthropic", "airbnb", "databricks",
-    # Additional high-volume tech companies on Greenhouse
-    "reddit", "discord", "duolingo", "robinhood", "plaid", "brex",
-    "coinbase", "lyft", "dropbox", "zendesk", "twilio", "okta",
-    "cloudflare", "hashicorp", "snowflakecomputing", "datadog",
-    "elastic", "mongodb", "confluent", "dbt-labs", "prefect",
-    "palantir", "asana", "notion-hq", "airtable",
+    "stripe", "anthropic", "airbnb", "databricks", "scaleai",
+    "coinbase", "lyft", "dropbox", "twilio", "okta",
+    "cloudflare", "datadog", "elastic", "mongodb",
+    "asana", "airtable", "duolingo", "discord", "reddit",
+    "robinhood", "github", "shopify", "zendesk",
 ]
 
 def scrape_greenhouse(roles):
     print("  [Greenhouse boards] scraping …")
     jobs, seen = [], set()
     for board in GREENHOUSE_BOARDS:
+        # Try new API URL first, fall back to classic
         raw = fetch(f"https://boards-api.greenhouse.io/v1/boards/{board}/jobs",
                     extra={"Accept":"application/json"})
+        if not raw:
+            raw = fetch(f"https://job-boards.greenhouse.io/{board}/jobs.json",
+                        extra={"Accept":"application/json"})
         if not raw: continue
         try: data = json.loads(raw)
         except Exception: continue
@@ -626,9 +640,12 @@ def scrape_greenhouse(roles):
 
 # ─── Source 11: Lever public boards ──────────────────────────────────────────
 
+# Lever boards — verified working April 2026
+# Dead boards removed: canva, miro, figma, benchling, scale, weights-biases, brex
 LEVER_BOARDS = [
-    "netflix","spotify","canva","miro","figma","notion","webflow",
-    "brex","rippling","benchling","scale","weights-biases",
+    "netflix", "spotify", "notion", "webflow", "rippling",
+    "linear", "vercel", "retool", "temporal", "ramp",
+    "census", "dagster", "preset", "airbyte",
 ]
 
 def scrape_lever(roles):
@@ -675,9 +692,9 @@ def scrape_lever(roles):
 
 def scrape_remotive(roles):
     print("  [Remotive] scraping …")
-    cats = ["software-dev","data","devops-sysadmin","all"]
+    cats = ["data","software-dev","devops-sysadmin"]
     jobs, seen = [], set()
-    for cat in cats[:2]:
+    for cat in cats:
         raw = fetch(f"https://remotive.com/api/remote-jobs?category={cat}&limit=100",
                     extra={"Accept":"application/json"})
         if not raw: continue
@@ -727,13 +744,13 @@ ALL_SCRAPERS = [
 
 
 def run(roles: list[str], work_pref: str = "Any",
-        progress_cb=None) -> list[dict]:
+        emp_type: str = "Any", progress_cb=None) -> list[dict]:
     """
     Scrape all sources for the given roles.
     progress_cb(source_name, count_so_far) is called after each source.
     Returns list of new job dicts (already deduplicated).
     """
-    print(f"\n🔍  Scraping {len(ALL_SCRAPERS)} sources | roles: {roles} | last {WINDOW_HOURS}h\n")
+    print(f"\n🔍  Scraping {len(ALL_SCRAPERS)} sources | roles: {roles} | type: {emp_type} | work: {work_pref} | last {WINDOW_HOURS}h\n")
     t0 = time.time()
 
     all_jobs = []
@@ -756,11 +773,19 @@ def run(roles: list[str], work_pref: str = "Any",
     # Drop None entries (non-US jobs filtered by make_job)
     all_jobs = [j for j in all_jobs if j is not None]
 
-    # Work-preference filter
+    # Work-preference filter (Remote / Hybrid / On-site)
     if work_pref.lower() not in ("any","all",""):
         wt = work_pref.capitalize()
         filtered = [j for j in all_jobs if j.get("work_type") == wt]
         if filtered: all_jobs = filtered
+
+    # Employment-type filter (Full-time / Contract / Any)
+    if emp_type and emp_type.lower() not in ("any","all",""):
+        et = emp_type.strip().title()
+        type_filtered = [j for j in all_jobs if j.get("employment_type","Full-time") == et]
+        if type_filtered:
+            all_jobs = type_filtered
+            print(f"     Employment filter '{et}': {len(all_jobs)} jobs")
 
     # Deduplicate by (norm-title, norm-company)
     seen_k, unique = set(), []

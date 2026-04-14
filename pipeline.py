@@ -149,7 +149,9 @@ def _run(u: str, profile: dict, opts: dict):
         _log(u, "Scraping all sources for last 24h jobs…")
 
         import scraper
-        raw_jobs = scraper.run(roles, work)
+        raw_jobs = scraper.run(roles, work,
+                emp_type=opts.get("employment_type_pref", "Any")
+            )
         s["jobs_scraped"] = len(raw_jobs)
         _log(u, f"Scraped {len(raw_jobs)} jobs total")
 
