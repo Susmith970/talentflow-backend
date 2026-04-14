@@ -246,9 +246,10 @@ A winning resume must demonstrate:
 {chr(10).join(f"  {i+1}. {m}" for i, m in enumerate(must_show[:6]))}"""
 
     # ── Build content payload ────────────────────────────────────────────────
+    yrs = int(profile.get("years_experience", 0) or 0)
     content = {
         "summary": profile.get("summary", ""),
-        "years_experience": profile.get("years_experience", 0),
+        "years_experience": yrs,
         "experience": [
             {"title": e.get("title",""), "company": e.get("company",""),
              "location": e.get("location",""), "dates": e.get("dates",""),
@@ -303,13 +304,16 @@ technical, and with real business impact. You can:
 ✓ Connect their AWS experience to Azure JD requirements naturally
 ✓ Write the summary from scratch — make it punchy and role-specific
 
-RULES:
-• NEVER change company names, job titles, employment dates, or school names
+RULES — ABSOLUTE CONSTRAINTS:
+• NEVER change company names, job titles, employment dates, school names, or years of experience
+• NEVER invent or rename companies. Output MUST use the exact company names from the input.
+• NEVER change years_experience in the summary. Use the exact number provided.
 • NEVER claim a degree or certification they don\'t have
 • Keep bullets technically accurate to their stack (don\'t invent unrelated tech)
-• Most recent job: 5-6 bullets. Each earlier job: 3-4 bullets.
+• Most recent job: 5-6 bullets. Second job: 4-5 bullets. Earlier jobs: 2-3 bullets.
+• Internship / entry-level (title contains "Intern" or "Junior"): MAX 2-3 bullets only.
 • Every bullet: [Power verb] + [specific technical action] + [JD keyword] + [metric]
-• Summary: 3-4 sentences, mirrors JD language, leads with years + domain
+• Summary: 3-4 sentences, mirrors JD language, opens with exact years_experience from input data
 • CRITICAL: Return ALL experience entries. If input has 5 jobs, return 5 jobs. Never omit any.
 
 BULLET FORMULA EXAMPLES:
@@ -519,7 +523,8 @@ def render_pdf(profile: dict, output_filename: str) -> str:
     def add_bullet(text: str):
         clean = re.sub(r"^[•\-–—*]\s*", "", str(text or "").strip())
         if clean:
-            story.append(Paragraph(f"&#x2022;&#160;&#160;{_x(clean)}", st_bullet))
+            # Use a simple dash bullet — avoids (cid:127) rendering issues in some PDF viewers
+            story.append(Paragraph(f"- &nbsp; {_x(clean)}", st_bullet))
 
     def add_skill_row(label: str, items: list):
         clean = [str(i).strip() for i in items if str(i).strip()]

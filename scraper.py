@@ -189,9 +189,14 @@ def make_job(uid, title, company, loc, source, url, posted, desc,
     _au = apply_url or url
     # Detect employment type from title and description
     _emp_text = (title + " " + desc).lower()
-    if any(w in _emp_text for w in ("contract","contractor","contract-to-hire","c2h","c2c","corp-to-corp","freelance","consultant")):
+    if any(w in _emp_text for w in (
+        "contract","contractor","contract-to-hire","c2h","c2c",
+        "corp-to-corp","corp to corp","freelance","consultant",
+        "temporary","temp role","temp position","1099","independent contractor",
+        "contract position","contract role","contract opportunity",
+        "6 month","6-month","12 month","12-month","contract to hire")):
         _emp_type = "Contract"
-    elif any(w in _emp_text for w in ("part-time","part time","parttime")):
+    elif any(w in _emp_text for w in ("part-time","part time","parttime","20 hours","20hrs")):
         _emp_type = "Part-time"
     else:
         _emp_type = "Full-time"  # default assumption
@@ -592,14 +597,22 @@ def scrape_yc(roles):
 # ─── Source 10: Greenhouse public boards ─────────────────────────────────────
 
 # Greenhouse boards — verified working April 2026
-# API endpoint: https://boards-api.greenhouse.io/v1/boards/{board}/jobs
-# Many companies switched to job-boards.greenhouse.io but API still works for these
 GREENHOUSE_BOARDS = [
+    # Big Tech / Cloud
     "stripe", "anthropic", "airbnb", "databricks", "scaleai",
     "coinbase", "lyft", "dropbox", "twilio", "okta",
     "cloudflare", "datadog", "elastic", "mongodb",
     "asana", "airtable", "duolingo", "discord", "reddit",
     "robinhood", "github", "shopify", "zendesk",
+    # Data / ML companies
+    "huggingface", "together", "cohere", "mistral",
+    "weights-biases", "great-expectations", "astronomer",
+    "dbtlabs", "fivetran", "hightouch", "getcensus",
+    # Fintech / Enterprise
+    "plaid", "brex", "ramp", "mercury", "moderntreasury",
+    "rippling", "gusto", "lattice", "leapsome",
+    # Healthcare / Other
+    "tempus", "flatiron", "komodohealth", "babylonhealth",
 ]
 
 def scrape_greenhouse(roles):
@@ -641,11 +654,15 @@ def scrape_greenhouse(roles):
 # ─── Source 11: Lever public boards ──────────────────────────────────────────
 
 # Lever boards — verified working April 2026
-# Dead boards removed: canva, miro, figma, benchling, scale, weights-biases, brex
 LEVER_BOARDS = [
     "netflix", "spotify", "notion", "webflow", "rippling",
     "linear", "vercel", "retool", "temporal", "ramp",
     "census", "dagster", "preset", "airbyte",
+    # Additional active Lever boards
+    "mixpanel", "amplitude", "segment", "heap",
+    "grafana", "honeycomb", "chronosphere", "observe",
+    "stytch", "clerk", "auth0", "okta",
+    "figma", "miro", "loom", "notion",
 ]
 
 def scrape_lever(roles):
@@ -732,6 +749,9 @@ ALL_SCRAPERS = [
     ("LinkedIn RSS",     scrape_linkedin_rss),
     ("We Work Remotely", scrape_weworkremotely),
     ("RemoteOK",         scrape_remoteok),
+    ("Otta",             scrape_otta),
+    ("FindWork",         scrape_findwork),
+    ("USAJobs",          scrape_usajobs),
     ("Jobright",         scrape_jobright),
     ("Arbeitnow",        scrape_arbeitnow),
     ("Jobicy",           scrape_jobicy),
@@ -741,6 +761,107 @@ ALL_SCRAPERS = [
     ("Lever boards",     scrape_lever),
     ("Remotive",         scrape_remotive),
 ]
+
+
+
+# ─── Source 13: Otta (tech jobs, strong data/eng focus) ──────────────────────
+
+def scrape_otta(roles):
+    print("  [Otta] scraping …")
+    jobs, seen = [], set()
+    try:
+        raw = fetch("https://api.otta.com/graphql", method="POST",
+                    body='{"query":"{ jobs(limit:100,offset:0) { id title company { name } location salary { min max currency } url description } }"}',
+                    extra={"Content-Type":"application/json","Accept":"application/json"})
+        if raw:
+            data = json.loads(raw)
+            for j in (data.get("data",{}).get("jobs") or []):
+                title = j.get("title","")
+                if not role_matches(title,"",roles): continue
+                uid = str(j.get("id",""))
+                if uid in seen: continue
+                seen.add(uid)
+                _mj = make_job(f"otta_{uid}", title,
+                    j.get("company",{}).get("name","Unknown"),
+                    j.get("location","Remote"), "Otta",
+                    j.get("url","https://app.otta.com"), "Today",
+                    j.get("description","")[:1000])
+                if _mj: jobs.append(_mj)
+    except Exception as e:
+        print(f"    ⚠  Otta: {e}")
+    print(f"     ✓ {len(jobs)}")
+    return jobs
+
+
+# ─── Source 14: FindWork.dev (tech jobs API, free) ────────────────────────────
+
+def scrape_findwork(roles):
+    print("  [FindWork] scraping …")
+    jobs, seen = [], set()
+    for role in roles[:4]:
+        try:
+            q   = urllib.parse.quote(role)
+            raw = fetch(f"https://findwork.dev/api/jobs/?search={q}&location=usa&order_by=-date",
+                        extra={"Authorization": "Token public"})
+            if not raw: continue
+            data = json.loads(raw)
+            for j in (data.get("results") or []):
+                title = j.get("role","")
+                if not role_matches(title,"",roles): continue
+                uid = str(j.get("id",""))
+                if uid in seen: continue
+                seen.add(uid)
+                loc = j.get("location","") or ("Remote" if j.get("remote") else "")
+                _mj = make_job(f"fw_{uid}", title,
+                    j.get("company_name","Unknown"), loc or "USA", "FindWork",
+                    j.get("url","https://findwork.dev"), j.get("date_posted","Today"),
+                    j.get("text","")[:1000])
+                if _mj: jobs.append(_mj)
+        except Exception as e:
+            print(f"    ⚠  FindWork: {e}")
+        time.sleep(0.3)
+    print(f"     ✓ {len(jobs)}")
+    return jobs
+
+
+# ─── Source 15: USAJobs.gov (federal + contract tech jobs) ────────────────────
+
+def scrape_usajobs(roles):
+    print("  [USAJobs] scraping …")
+    jobs, seen = [], set()
+    for role in roles[:3]:
+        try:
+            q   = urllib.parse.quote(role)
+            raw = fetch(
+                f"https://data.usajobs.gov/api/search?Keyword={q}&LocationName=United+States&ResultsPerPage=25&DatePosted=7",
+                extra={"Host":"data.usajobs.gov","User-Agent":"talentflow/1.0"})
+            if not raw: continue
+            data = json.loads(raw)
+            items = data.get("SearchResult",{}).get("SearchResultItems",[])
+            for item in items:
+                jd = item.get("MatchedObjectDescriptor",{})
+                title = jd.get("PositionTitle","")
+                if not role_matches(title,"",roles): continue
+                uid = jd.get("PositionID","")
+                if uid in seen: continue
+                seen.add(uid)
+                loc = jd.get("PositionLocationDisplay","USA")
+                pay = jd.get("PositionRemuneration",[{}])
+                sal = pay[0].get("MinimumRange","") if pay else ""
+                url = jd.get("ApplyURI",[""])[0] if jd.get("ApplyURI") else jd.get("PositionURI","")
+                # Detect contract from job type
+                schd = " ".join(str(s) for s in jd.get("PositionSchedule",[]))
+                desc = jd.get("UserArea",{}).get("Details",{}).get("JobSummary","")[:1000]
+                _mj = make_job(f"usaj_{uid}", title,
+                    jd.get("OrganizationName","US Government"), loc, "USAJobs",
+                    url, jd.get("PublicationStartDate","Today")[:10], desc,
+                    salary=sal)
+                if _mj: jobs.append(_mj)
+        except Exception as e:
+            print(f"    ⚠  USAJobs: {e}")
+        time.sleep(0.5)
+    print(f"     ✓ {len(jobs)}")
+    return jobs
 
 
 def run(roles: list[str], work_pref: str = "Any",
