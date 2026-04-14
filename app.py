@@ -93,6 +93,8 @@ def require_auth():
 @app.get("/api/health")
 def health():
     return jsonify({"ok": True, "service": "TalentFlow API", "version": "1.4.0",
+                    "db_mode": "postgresql" if db.USE_POSTGRES else "json_files",
+                    "db_persists": db.USE_POSTGRES,
                     "features": ["token-auth", "persistent-tokens", "extract-profile", "two-pass-tailor"]})
 
 

@@ -742,28 +742,6 @@ def scrape_remotive(roles):
     return jobs
 
 
-# ─── Main ─────────────────────────────────────────────────────────────────────
-
-ALL_SCRAPERS = [
-    ("LinkedIn HTML",    scrape_linkedin_html),
-    ("LinkedIn RSS",     scrape_linkedin_rss),
-    ("We Work Remotely", scrape_weworkremotely),
-    ("RemoteOK",         scrape_remoteok),
-    ("Otta",             scrape_otta),
-    ("FindWork",         scrape_findwork),
-    ("USAJobs",          scrape_usajobs),
-    ("Jobright",         scrape_jobright),
-    ("Arbeitnow",        scrape_arbeitnow),
-    ("Jobicy",           scrape_jobicy),
-    ("HN Hiring",        scrape_hn),
-    ("YC Jobs",          scrape_yc),
-    ("Greenhouse",       scrape_greenhouse),
-    ("Lever boards",     scrape_lever),
-    ("Remotive",         scrape_remotive),
-]
-
-
-
 # ─── Source 13: Otta (tech jobs, strong data/eng focus) ──────────────────────
 
 def scrape_otta(roles):
@@ -862,6 +840,28 @@ def scrape_usajobs(roles):
         time.sleep(0.5)
     print(f"     ✓ {len(jobs)}")
     return jobs
+
+
+
+# ─── Main ─────────────────────────────────────────────────────────────────────
+
+ALL_SCRAPERS = [
+    ("LinkedIn HTML",    scrape_linkedin_html),
+    ("LinkedIn RSS",     scrape_linkedin_rss),
+    ("We Work Remotely", scrape_weworkremotely),
+    ("RemoteOK",         scrape_remoteok),
+    ("Otta",             scrape_otta),
+    ("FindWork",         scrape_findwork),
+    ("USAJobs",          scrape_usajobs),
+    ("Jobright",         scrape_jobright),
+    ("Arbeitnow",        scrape_arbeitnow),
+    ("Jobicy",           scrape_jobicy),
+    ("HN Hiring",        scrape_hn),
+    ("YC Jobs",          scrape_yc),
+    ("Greenhouse",       scrape_greenhouse),
+    ("Lever boards",     scrape_lever),
+    ("Remotive",         scrape_remotive),
+]
 
 
 def run(roles: list[str], work_pref: str = "Any",
