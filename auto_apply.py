@@ -187,14 +187,20 @@ def _answer(question: str, profile: dict) -> str:
         if c.lower() in ("united states","us","usa","u.s.","u.s.a."):
             return "United States"  # matches both "United States" and "United States of America"
         return c
-    if any(x in q for x in ("location","where are you located","city, state")):
-        return profile.get("location","")
+    if any(x in q for x in ("location","where are you located","city, state",
+                              "current location","what is your location",
+                              "where are you based","where do you live",
+                              "city and state","city/state")):
+        loc = profile.get("location","")
+        if not loc:
+            city  = profile.get("address_city","")
+            state = profile.get("address_state","")
+            loc   = f"{city}, {state}".strip(", ") if city or state else ""
+        return loc
 
     # ── Professional links ────────────────────────────────────────────────────
     if "linkedin" in q:
-        li = profile.get("linkedin","")
-        if li and not li.startswith("http"): li = "https://linkedin.com/in/" + li.lstrip("/")
-        return li
+        return _fmt_url(profile.get("linkedin",""), "https://linkedin.com/in/")
     if "github" in q:
         gh = profile.get("github","")
         if gh and not gh.startswith("http"): gh = "https://github.com/" + gh.lstrip("/")
@@ -1873,7 +1879,23 @@ def apply_lever(job: dict, profile: dict, username: str) -> dict:
             L("Clicked submit — waiting…")
             _jitter(4, 6)
 
-            # ── 7. Scroll to top and check for errors ─────────────────────
+            # ── 7. Dismiss cookie banners then scroll to top ───────────────
+            for cookie_sel in [
+                "button:has-text('Accept')", "button:has-text('accept')",
+                "button:has-text('Accept All')", "button:has-text('Allow')",
+                "button:has-text('OK')", "button:has-text('Got it')",
+                "button:has-text('Agree')", "[id*=cookie] button",
+                "[class*=cookie] button", "[aria-label*=cookie]",
+            ]:
+                try:
+                    btn = page.locator(cookie_sel)
+                    if btn.count() > 0 and btn.first.is_visible():
+                        btn.first.click()
+                        _jitter(0.5, 1)
+                        L(f"Dismissed cookie banner via {cookie_sel}")
+                        break
+                except Exception: pass
+
             try: page.evaluate("window.scrollTo(0,0)"); _jitter(1, 1.5)
             except Exception: pass
 
@@ -1893,6 +1915,7 @@ def apply_lever(job: dict, profile: dict, username: str) -> dict:
                     return _nope("lever", f"Validation errors: {errors2[0][:80]}", job)
 
             # ── 8. Confirm success ────────────────────────────────────────
+            _jitter(1, 2)  # extra wait for Lever AJAX response
             post_url  = page.url
             page_text = ""
             try: page_text = page.inner_text("body")
@@ -1900,26 +1923,44 @@ def apply_lever(job: dict, profile: dict, username: str) -> dict:
 
             success_phrases = ["thank you","thanks for applying","application received",
                                "successfully submitted","we have received","you applied",
-                               "application complete","application submitted","check your email"]
-            url_keys        = ["thank","confirm","success","applied","complete","submitted"]
+                               "application complete","application submitted","check your email",
+                               "your application has been","we'll be in touch",
+                               "received your application","application was submitted"]
+            url_keys = ["thank","confirm","success","applied","complete","submitted"]
 
-            confirmed = (any(ph in page_text.lower() for ph in success_phrases)
+            # Lever submits via AJAX — URL stays the same but form disappears
+            lever_ajax_ok = False
+            try:
+                name_input_gone  = page.locator("input[name='name']:visible").count() == 0
+                submit_btn_gone  = page.locator("button:has-text('Submit application'):visible").count() == 0
+                if name_input_gone or submit_btn_gone:
+                    lever_ajax_ok = True
+                    L("Lever AJAX: form inputs gone — treat as success")
+            except Exception: pass
+
+            # Strip cookie banner text from page_text before checking
+            clean_text = page_text.lower()
+            for noise in ["privacy notice","this website uses cookies","by clicking accept",
+                          "denyaccept","cookie policy"]:
+                clean_text = clean_text.replace(noise, "")
+
+            confirmed = (lever_ajax_ok
+                         or any(ph in clean_text for ph in success_phrases)
                          or any(k in post_url.lower() for k in url_keys))
 
             L(f"Post-submit URL: {post_url[:80]}")
             if confirmed:
-                L(f"✓ CONFIRMED submitted — confirmation phrase found")
+                L("✓ CONFIRMED submitted")
                 browser.close()
                 return {"success":True,"platform":"lever","manual":False}
             else:
-                L(f"~ Submit clicked but CANNOT CONFIRM success")
-                L(f"  Page snippet: {page_text[:200]}")
-                L(f"  Check your email for confirmation from Spotify/company")
+                L("~ Cannot confirm — checking if Lever AJAX submitted silently")
+                L(f"  Page snippet: {page_text[:300]}")
                 browser.close()
-                # Return success=False so it's NOT marked submitted in DB
-                # until we actually confirm it
+                # Lever often stays on same page after AJAX submit
+                # Mark manual so user can verify — better than false positive
                 return {"success":False,"platform":"lever","manual":True,
-                        "reason":"Submitted but could not confirm — check your email and mark manually"}
+                        "reason":"Submitted but unconfirmed — check your email and mark manually if received"}
 
         except Exception as e:
             import traceback
