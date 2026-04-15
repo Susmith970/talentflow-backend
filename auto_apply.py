@@ -212,6 +212,9 @@ def _answer(question: str, profile: dict) -> str:
     if any(x in q for x in ("current company","current employer","where do you work",
                               "current organization","present employer")):
         return profile.get("current_company","")
+    # Lever uses name="org" — single-word field labels
+    if q.strip().lower() in ("org","company","organization","employer","current org","company name"):
+        return profile.get("current_company","")
     if any(x in q for x in ("currently employed","are you employed","employment status")):
         return "Yes" if profile.get("current_company") else "No"
 
@@ -297,6 +300,8 @@ def _answer(question: str, profile: dict) -> str:
         return profile.get("race_ethnicity","Prefer not to say")
     if any(x in q for x in ("pronoun","preferred pronoun")):
         return profile.get("pronouns","") or "Prefer not to say"
+    if any(x in q for x in ("gender","gender identity","sex","identify as")):
+        return profile.get("gender","Prefer not to say")
 
     # ── Background / compliance ───────────────────────────────────────────────
     if any(x in q for x in ("background check","criminal background","background screening")):
@@ -306,7 +311,8 @@ def _answer(question: str, profile: dict) -> str:
 
     # ── Referral source ───────────────────────────────────────────────────────
     if any(x in q for x in ("hear about","how did you find","referral","source","referred by",
-                              "where did you hear")):
+                              "where did you hear","how did you hear","learn about",
+                              "how did you come","found this job","find out about")):
         return profile.get("referral_source","LinkedIn")
 
     # ── Generic yes/no defaults ───────────────────────────────────────────────
@@ -1522,27 +1528,69 @@ def _fill_all(page, profile: dict, job: dict, cover: str, username: str):
 
 
 def _audit_form(page, username: str):
-    """Log filled vs empty required fields before submit."""
+    """Log filled vs empty required fields before submit.
+    Catches HTML required, aria-required, AND Lever/Greenhouse CSS-class required."""
     def L(msg): db.log(username, f"  [AUDIT] {msg}")
     try:
-        filled, empty_req = [], []
-        for inp in page.locator("input:visible,select:visible,textarea:visible").all()[:30]:
+        filled, empty_req, empty_opt = [], [], []
+        # Broader selector: also catch fields inside .required wrappers (Lever style)
+        for inp in page.locator(
+            "input:visible, select:visible, textarea:visible"
+        ).all()[:40]:
             try:
                 itype = inp.get_attribute("type") or ""
-                if itype in ("file","hidden","submit"): continue
-                label = _get_label(page, inp) or inp.get_attribute("placeholder") or inp.get_attribute("name") or "?"
-                val   = inp.input_value() or ""
-                is_req = (inp.get_attribute("required") is not None or
-                          inp.get_attribute("aria-required")=="true")
-                if val: filled.append(f"{label[:20]}={val[:15]}")
-                elif is_req: empty_req.append(label[:30])
+                if itype in ("file","hidden","submit","button","reset"): continue
+
+                # Get best label
+                label = (_get_label(page, inp)
+                         or inp.get_attribute("placeholder")
+                         or inp.get_attribute("name")
+                         or inp.get_attribute("aria-label")
+                         or "?")
+                label = label.strip()[:35]
+                val   = (inp.input_value() or "").strip()
+
+                # Detect required: HTML attr OR aria-required OR parent has .required class
+                html_req  = inp.get_attribute("required") is not None
+                aria_req  = inp.get_attribute("aria-required") == "true"
+                # Check parent element for required class (Lever, Greenhouse pattern)
+                css_req = False
+                try:
+                    css_req = bool(page.evaluate(
+                        """el => {
+                            let p = el.parentElement;
+                            for(let i=0;i<4;i++){
+                                if(!p) break;
+                                if(p.classList.contains('required') ||
+                                   p.querySelector('abbr[title=required]') ||
+                                   p.querySelector('.required-mark') ||
+                                   p.querySelector('[aria-label*=required]'))
+                                    return true;
+                                p = p.parentElement;
+                            }
+                            return false;
+                        }""", inp.element_handle()))
+                except Exception: pass
+
+                is_req = html_req or aria_req or css_req
+
+                if val:
+                    filled.append(f"{label}={val[:20]}")
+                elif is_req:
+                    empty_req.append(label)
+                else:
+                    empty_opt.append(label)
             except Exception: pass
-        L(f"Filled: {len(filled)} fields")
-        for f in filled[:10]: L(f"  ✓ {f}")
+
+        L(f"Pre-submit: {len(filled)} filled, {len(empty_req)} empty-required, {len(empty_opt)} empty-optional")
+        for f in filled[:15]: L(f"  ✓ {f}")
         if empty_req:
-            L(f"Empty required: {len(empty_req)}")
-            for e in empty_req: L(f"  ✗ {e}")
-    except Exception: pass
+            L(f"⚠ EMPTY REQUIRED FIELDS ({len(empty_req)}) — likely cause of form rejection:")
+            for e in empty_req: L(f"  ✗ REQUIRED: {e}")
+        if empty_opt and len(empty_opt) <= 8:
+            L(f"  Optional empty: {', '.join(empty_opt)}")
+    except Exception as ex:
+        L(f"Audit error: {ex}")
 
 
 def _get_errors(page) -> list:
@@ -2119,11 +2167,16 @@ def detect_ats(url: str) -> str:
 
 
 def _fmt_url(val: str, prefix: str = "") -> str:
-    v = str(val or "").strip()
+    """Return full URL — never double-prefix linkedin.com or github.com."""
+    v = str(val or "").strip().lstrip("/")
     if not v: return ""
-    if v.startswith("http"): return v
-    base = prefix.split("//")[-1] if "//" in prefix else prefix
-    return (prefix + v) if prefix and not v.startswith(base) else v
+    if v.startswith("http://") or v.startswith("https://"): return v
+    base = prefix.replace("https://","").replace("http://","").rstrip("/")
+    if base and v.startswith(base):
+        return "https://" + v
+    if prefix:
+        return prefix.rstrip("/") + "/" + v
+    return "https://" + v
 
 
 # ── Dispatcher ────────────────────────────────────────────────────────────────
