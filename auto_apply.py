@@ -337,6 +337,95 @@ def _answer(question: str, profile: dict) -> str:
     return ""
 
 
+def _claude_answer(question: str, field_type: str, profile: dict, job: dict) -> str:
+    """
+    Ask Claude to answer a required form field we don't have a rule for.
+    Only called when _answer() returns "" AND the field is required.
+    Uses profile + job context to generate a relevant, concise answer.
+    Caches answers in profile["custom_answers"] so the same question isn't
+    asked twice across applications.
+    """
+    api_key = os.environ.get("ANTHROPIC_API_KEY","")
+    if not api_key:
+        return ""
+
+    q = (question or "").strip()
+    if not q or len(q) < 3:
+        return ""
+
+    # Check cache first (custom_answers acts as persistent Q&A store)
+    q_lower = q.lower()
+    for qa in (profile.get("custom_answers") or []):
+        if not isinstance(qa, dict): continue
+        saved = (qa.get("question") or "").lower()
+        if saved and (saved in q_lower or q_lower in saved):
+            cached = qa.get("answer","")
+            if cached:
+                return cached
+
+    try:
+        import anthropic
+
+        # Build a concise profile summary for Claude
+        exp_summary = "; ".join(
+            f"{e.get('title','')} at {e.get('company','')} ({e.get('dates','')})"
+            for e in (profile.get("experience") or [])[:3]
+        )
+        skills = ", ".join((profile.get("skills",[]) + profile.get("ml_skills",[]))[:10])
+
+        system = (
+            "You are filling out a job application form on behalf of a candidate. "
+            "Answer the question concisely and professionally — 1-3 sentences max for text fields, "
+            "a single word or short phrase for dropdowns/selects. "
+            "Only use facts from the candidate profile. Never invent information. "
+            "If the question asks for a number, return only the number. "
+            "If it asks Yes/No, return only Yes or No."
+        )
+
+        prompt = f"""Candidate profile:
+Name: {profile.get("name","")}
+Years experience: {profile.get("years_experience","")}
+Current role: {(profile.get("experience") or [{}])[0].get("title","")} at {(profile.get("experience") or [{}])[0].get("company","")}
+Recent experience: {exp_summary}
+Skills: {skills}
+Location: {profile.get("location","")}
+Education: {(profile.get("education") or [{}])[0].get("degree","")} from {(profile.get("education") or [{}])[0].get("school","")}
+Work authorized: {profile.get("work_authorized","Yes")}
+Requires sponsorship: {profile.get("requires_sponsorship","No")}
+
+Job being applied to:
+Title: {job.get("title","")}
+Company: {job.get("company","")}
+Description: {(job.get("description") or "")[:500]}
+
+Application form question (field type: {field_type}):
+"{question}"
+
+Answer this question for the candidate. Be concise. Return ONLY the answer, no explanation."""
+
+        msg = anthropic.Anthropic(api_key=api_key).messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=150,
+            messages=[{"role":"user","content":prompt}],
+            system=system,
+        )
+        answer = (msg.content[0].text or "").strip()
+
+        # Cache the answer so we don't ask again
+        if answer:
+            custom = list(profile.get("custom_answers") or [])
+            # Avoid duplicates
+            if not any((qa.get("question","")).lower() == q_lower for qa in custom):
+                custom.append({"question": question, "answer": answer, "ai_generated": True})
+                profile["custom_answers"] = custom
+
+        return answer
+
+    except Exception as e:
+        print(f"  [Claude answer] error for '{question[:40]}': {e}")
+        return ""
+
+
 def _select(label: str, options: list, profile: dict) -> str:
     """Pick the best dropdown option for any application question."""
     lab  = (label or "").lower()
@@ -1533,6 +1622,28 @@ def _fill_all(page, profile: dict, job: dict, cover: str, username: str):
             combined = (attrs+" "+label).lower()
             val      = _answer(label or combined, profile)
             if val and any(b in str(val).lower() for b in BAD_URLS): val=""
+
+            # If no rule-based answer and field is required → ask Claude
+            if not val:
+                try:
+                    html_req = inp.get_attribute("required") is not None
+                    aria_req = inp.get_attribute("aria-required") == "true"
+                    css_req  = False
+                    try:
+                        css_req = bool(page.evaluate(
+                            """el => { let p=el.parentElement;
+                               for(let i=0;i<4;i++){
+                                 if(!p)break;
+                                 if(p.classList.contains('required'))return true;
+                                 p=p.parentElement;} return false;}""",
+                            inp.element_handle()))
+                    except Exception: pass
+                    if html_req or aria_req or css_req:
+                        val = _claude_answer(label or combined, itype, profile, job)
+                        if val: L(f"Claude answered '{(label or combined)[:30]}' = '{val[:30]}'")
+                except Exception: pass
+
+            if val and any(b in str(val).lower() for b in BAD_URLS): val=""
             if val:
                 inp.fill(str(val)); filled.append(f"{label[:20] or attrs[:20]}={str(val)[:15]}")
                 _jitter(0.05, 0.15)
@@ -1609,6 +1720,26 @@ def _fill_all(page, profile: dict, job: dict, cover: str, username: str):
                 if best_score >= 70:
                     break  # good enough match found — stop trying more candidates
 
+            # If no match found and field is required → ask Claude to pick an option
+            if not matched_label and not matched_value:
+                try:
+                    html_req = sel_el.get_attribute("required") is not None
+                    aria_req = sel_el.get_attribute("aria-required") == "true"
+                    if (html_req or aria_req) and opt_pairs:
+                        opt_labels = [ot for ot,_ in opt_pairs]
+                        claude_pick = _claude_answer(
+                            f"{label} (choose one: {', '.join(opt_labels[:8])})",
+                            "select", profile, job)
+                        if claude_pick:
+                            # Find the best matching option for Claude's answer
+                            for ot, ov in opt_pairs:
+                                s = _score_opt(claude_pick, ot, ov)
+                                if s > best_score:
+                                    best_score, matched_label, matched_value = s, ot, ov
+                            if matched_label:
+                                L(f"Claude picked '{label[:25]}' = '{matched_label[:25]}'")
+                except Exception: pass
+
             if matched_label or matched_value:
                 try:
                     # Try by value first (more reliable), then by label
@@ -1665,6 +1796,30 @@ def _fill_all(page, profile: dict, job: dict, cover: str, username: str):
                 except Exception: pass
         except Exception: pass
 
+    # ── Textareas (open-ended questions) ────────────────────────────────────
+    for ta in page.locator("textarea:visible").all():
+        try:
+            if not ta.is_visible() or ta.is_disabled(): continue
+            if (ta.input_value() or "").strip(): continue  # already filled
+            label    = _get_label(page, ta) or ta.get_attribute("placeholder") or ta.get_attribute("name") or ""
+            combined = label.lower()
+            # Skip cover letter (handled separately)
+            if any(x in combined for x in ("cover","comment","message","additional info",
+                                            "anything else","tell us more")):
+                continue
+            html_req = ta.get_attribute("required") is not None
+            aria_req = ta.get_attribute("aria-required") == "true"
+            if not (html_req or aria_req): continue  # only fill required textareas
+            val = _answer(combined, profile)
+            if not val:
+                val = _claude_answer(label or combined, "textarea", profile, job)
+                if val: L(f"Claude answered textarea '{label[:30]}' = '{val[:40]}...'")
+            if val:
+                ta.fill(str(val))
+                filled.append(f"{label[:20]}(textarea)={str(val)[:15]}")
+                _jitter(0.1, 0.3)
+        except Exception: pass
+
     # ── Checkboxes ───────────────────────────────────────────────────────────
     for chk in page.locator("input[type=checkbox]:visible").all():
         try:
@@ -1680,6 +1835,22 @@ def _fill_all(page, profile: dict, job: dict, cover: str, username: str):
         except Exception: pass
 
     if filled: L(f"Filled {len(filled)}: {', '.join(filled[:8])}")
+
+    # Persist any new Claude-generated answers back to profile DB
+    # so the same question won't trigger another API call next time
+    try:
+        new_qa = [qa for qa in (profile.get("custom_answers") or [])
+                  if qa.get("ai_generated") and qa not in
+                     (db.get_profile(profile.get("username","")) or {}).get("custom_answers",[])]
+        if new_qa:
+            username = profile.get("username","")
+            if username:
+                existing = db.get_profile(username)
+                if existing:
+                    merged = list(existing.get("custom_answers") or []) + new_qa
+                    db.update_profile(username, {"custom_answers": merged})
+                    L(f"Saved {len(new_qa)} new Claude answer(s) to profile")
+    except Exception: pass
 
 
 def _audit_form(page, username: str):
