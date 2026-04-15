@@ -1574,24 +1574,25 @@ def _location_candidates(profile: dict) -> list:
         country_variants = [country]
 
     candidates = []
-    # Most specific first: city
+    # 1. City only (matches city dropdowns)
     if city: candidates.append(city)
-    # State (full name then abbreviation)
+    # 2. State full name (matches state dropdowns)
     if state_full and state_full != state: candidates.append(state_full)
+    # 3. State abbreviation
     if state: candidates.append(state)
-    # Full location string
-    if location: candidates.append(location)
-    # City + state combos
+    # 4. "City, State, Country" — e.g. "Sterling, Virginia, United States"
+    if city and state_full: candidates.append(f"{city}, {state_full}, United States")
+    if city and state_full: candidates.append(f"{city}, {state_full}, US")
+    if city and state:      candidates.append(f"{city}, {state}, United States")
+    # 5. "City, State" — e.g. "Reston, VA" or "Reston, Virginia"
     if city and state_full: candidates.append(f"{city}, {state_full}")
     if city and state:      candidates.append(f"{city}, {state}")
-    # City, State, Country — "Sterling, Virginia, United States"
-    if city and state_full: candidates.append(f"{city}, {state_full}, United States")
-    if city and state:      candidates.append(f"{city}, {state}, United States")
-    if city and state_full: candidates.append(f"{city}, {state_full}, US")
-    # State, Country combos
+    # 6. Full location string from profile
+    if location: candidates.append(location)
+    # 7. State, Country combos
     if state_full: candidates.append(f"{state_full}, United States")
     if state:      candidates.append(f"{state}, United States")
-    # Country variants
+    # 8. Country variants (broadest — last resort)
     candidates.extend(country_variants)
     # Remove duplicates while preserving order
     seen, result = set(), []
