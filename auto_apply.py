@@ -1481,20 +1481,39 @@ def _fill_all(page, profile: dict, job: dict, cover: str, username: str):
 
             # Collect all non-empty options
             opts = sel_el.locator("option").all()
-            skip_vals = {"","select","-- select --","choose","none","0","please select"}
-            matched_label = None
-            matched_value = None
+            skip_vals = {"","select","-- select --","choose","none","0",
+                         "please select","select...","select a country","select a state"}
+            opt_pairs = []
             for opt in opts:
-                ot  = (opt.inner_text() or "").strip()
-                ov  = (opt.get_attribute("value") or "").strip()
-                if ot.lower() in skip_vals or ov.lower() in skip_vals:
-                    continue
-                # Match: our answer is substring of option OR option is substring of our answer
-                if (val.lower() in ot.lower() or ot.lower() in val.lower()
-                    or val.lower() in ov.lower() or ov.lower() in val.lower()):
-                    matched_label = ot
-                    matched_value = ov
-                    break
+                ot = (opt.inner_text() or "").strip()
+                ov = (opt.get_attribute("value") or "").strip()
+                if ot.lower() not in skip_vals and ov.lower() not in skip_vals:
+                    opt_pairs.append((ot, ov))
+
+            # Score-based matching — handles "United States +1", "No, I do not require..."
+            val_l = val.strip().lower()
+            noise = {"a","the","i","in","do","of","or","at","any","time","future",
+                     "require","sponsorship","may","currently","will","you","now"}
+            val_neg = "not" in val_l.split() or val_l.startswith("no ")
+
+            best_score, matched_label, matched_value = 0, None, None
+            for ot, ov in opt_pairs:
+                ot_l = ot.lower(); ov_l = ov.lower()
+                opt_neg = "not" in ot_l.split() or ot_l.startswith("no ")
+                neg_pen = 40 if (val_neg != opt_neg) else 0
+                score = 0
+                if val_l == ot_l or val_l == ov_l:                      score = 100
+                elif ot_l.startswith(val_l) or ov_l.startswith(val_l):  score = 90
+                elif val_l in ot_l or val_l in ov_l:                    score = 80
+                elif ot_l in val_l or ov_l in val_l:                    score = 70
+                else:
+                    vw = set(val_l.split()) - noise
+                    ow = set(ot_l.split()) - noise
+                    if vw and ow:
+                        score = int(len(vw & ow) / len(vw) * 60)
+                score = max(0, score - neg_pen)
+                if score > best_score:
+                    best_score, matched_label, matched_value = score, ot, ov
 
             if matched_label or matched_value:
                 try:
