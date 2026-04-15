@@ -181,8 +181,12 @@ def _answer(question: str, profile: dict) -> str:
         return state
     if any(x in q for x in ("zip","postal code","postcode","zip code")):
         return profile.get("address_zip","")
-    if any(x in q for x in ("country","nation")):
-        return profile.get("address_country","United States")
+    if any(x in q for x in ("country","nation","country of residence","country of citizenship")):
+        c = profile.get("address_country","United States")
+        # Greenhouse uses "United States of America" in some boards
+        if c.lower() in ("united states","us","usa","u.s.","u.s.a."):
+            return "United States"  # matches both "United States" and "United States of America"
+        return c
     if any(x in q for x in ("location","where are you located","city, state")):
         return profile.get("location","")
 
@@ -224,7 +228,9 @@ def _answer(question: str, profile: dict) -> str:
                               "work in the united states","permitted to work")):
         return profile.get("work_authorized","Yes")
     if any(x in q for x in ("require sponsorship","need sponsorship","visa sponsorship",
-                              "will you require","sponsor","h1b","h-1b")):
+                              "will you require","will you now","at any time","future require",
+                              "sponsor","h1b","h-1b","work authorization required",
+                              "employment sponsorship")):
         return profile.get("requires_sponsorship","No")
     if any(x in q for x in ("citizenship","citizen","citizenship status","immigration status")):
         return profile.get("citizenship_status","U.S. Citizen")
@@ -1465,22 +1471,58 @@ def _fill_all(page, profile: dict, job: dict, cover: str, username: str):
     for sel_el in page.locator("select:visible").all():
         try:
             if not sel_el.is_visible() or sel_el.is_disabled(): continue
-            if (sel_el.input_value() or "").strip() not in ("","Select","-- Select --"): continue
-            label    = _get_label(page, sel_el) or sel_el.get_attribute("name") or ""
+            curr_val = (sel_el.input_value() or "").strip()
+            if curr_val not in ("","0","Select","-- Select --","Choose","None"):
+                continue  # already has a value
+            label    = _get_label(page, sel_el) or sel_el.get_attribute("name") or sel_el.get_attribute("id") or ""
             combined = label.lower()
             val      = _answer(combined, profile)
             if not val: continue
+
+            # Collect all non-empty options
             opts = sel_el.locator("option").all()
-            matched = None
+            skip_vals = {"","select","-- select --","choose","none","0","please select"}
+            matched_label = None
+            matched_value = None
             for opt in opts:
-                ot = (opt.inner_text() or "").strip()
-                if not ot or ot.lower() in ("select","-- select --","choose"): continue
-                if val.lower() in ot.lower() or ot.lower() in val.lower():
-                    matched = ot; break
-            if matched:
-                sel_el.select_option(label=matched)
-                filled.append(f"{label[:20]}(sel)={matched[:15]}")
-                _jitter(0.1, 0.2)
+                ot  = (opt.inner_text() or "").strip()
+                ov  = (opt.get_attribute("value") or "").strip()
+                if ot.lower() in skip_vals or ov.lower() in skip_vals:
+                    continue
+                # Match: our answer is substring of option OR option is substring of our answer
+                if (val.lower() in ot.lower() or ot.lower() in val.lower()
+                    or val.lower() in ov.lower() or ov.lower() in val.lower()):
+                    matched_label = ot
+                    matched_value = ov
+                    break
+
+            if matched_label or matched_value:
+                try:
+                    # Try by value first (more reliable), then by label
+                    if matched_value:
+                        sel_el.select_option(value=matched_value)
+                    else:
+                        sel_el.select_option(label=matched_label)
+                    # Trigger change event so Greenhouse/Lever JS picks it up
+                    try:
+                        sel_el.dispatch_event("change")
+                        sel_el.dispatch_event("input")
+                    except Exception: pass
+                    _jitter(0.2, 0.4)
+                    # Verify it stuck
+                    new_val = (sel_el.input_value() or "").strip()
+                    if new_val and new_val not in skip_vals:
+                        filled.append(f"{label[:20]}(sel)={matched_label[:15] if matched_label else new_val[:15]}")
+                    else:
+                        # JS reset it — try clicking the option directly
+                        try:
+                            sel_el.select_option(index=opts.index(
+                                next(o for o in opts if
+                                     (opt.inner_text() or "").strip() == matched_label))+1
+                            )
+                        except Exception: pass
+                except Exception as se:
+                    pass
         except Exception: pass
 
     # ── Radio buttons ────────────────────────────────────────────────────────
