@@ -311,13 +311,17 @@ def _answer(question: str, profile: dict) -> str:
                               "what is your disability","disability status","disability or impairment")):
         return profile.get("disability_status","I do not have a disability")
     if re.search(r"gender|sex", q):
-        return profile.get("gender","Prefer not to say")
+        return profile.get("gender","Male")
     if any(x in q for x in ("race","ethnicity","hispanic","latino","ancestry")):
-        return profile.get("race_ethnicity","Prefer not to say")
+        return profile.get("race_ethnicity","Asian")
+    if any(x in q for x in ("lgbt","lgbtq","lgbtqia","sexual orientation",
+                              "identify as part of","gender identity or expression",
+                              "transgender","nonbinary","non-binary")):
+        return profile.get("lgbtq_status","Prefer not to say")
     if any(x in q for x in ("pronoun","preferred pronoun")):
         return profile.get("pronouns","") or "Prefer not to say"
     if any(x in q for x in ("gender","gender identity","sex","identify as")):
-        return profile.get("gender","Prefer not to say")
+        return profile.get("gender","Male")
 
     # ── Background / compliance ───────────────────────────────────────────────
     if any(x in q for x in ("background check","criminal background","background screening")):
@@ -330,6 +334,20 @@ def _answer(question: str, profile: dict) -> str:
                               "where did you hear","how did you hear","learn about",
                               "how did you come","found this job","find out about")):
         return profile.get("referral_source","LinkedIn")
+
+    # ── Company-specific questions ────────────────────────────────────────────
+    if any(x in q for x in ("have you ever worked for","previously worked for",
+                              "former employee","previously employed by",
+                              "worked at this company","employed by us before")):
+        return "No"
+    if any(x in q for x in ("personal/family","family relationship","relative of",
+                              "know anyone who works","related to any employee",
+                              "conflict of interest","outside business","outside employment",
+                              "personal relationship","do you have: a)")):
+        return "No"
+    if any(x in q for x in ("have you used","do you use our","are you a customer of",
+                              "have you ever used our")):
+        return "Yes"
 
     # ── Generic yes/no defaults ───────────────────────────────────────────────
     yes_patterns = ["agree","consent","acknowledge","confirm","understand",
@@ -1769,33 +1787,51 @@ def _fill_all(page, profile: dict, job: dict, cover: str, username: str):
                             sel_el.select_option(label=matched_label)
                     except Exception: pass
 
-                    # Method 2: Force via JavaScript (handles React/Vue controlled selects)
+                    # Method 2: React native setter + value tracker reset + all events
                     try:
                         page.evaluate("""
                             (args) => {
                                 const sel = args.el;
                                 const val = args.val;
                                 const lbl = args.lbl;
-                                // Try matching by value first, then text
+                                let matched_opt = null;
                                 for (let opt of sel.options) {
-                                    if (opt.value === val || opt.text.trim() === lbl ||
-                                        opt.text.toLowerCase().includes(lbl.toLowerCase()) ||
-                                        lbl.toLowerCase().includes(opt.text.trim().toLowerCase())) {
-                                        sel.value = opt.value;
-                                        opt.selected = true;
-                                        break;
+                                    const ot = opt.text.trim().toLowerCase();
+                                    const ov = (opt.value||'').toLowerCase();
+                                    const vl = lbl.toLowerCase();
+                                    if (ov===val.toLowerCase()||ot===vl||ot.includes(vl)||vl.includes(ot)){
+                                        matched_opt = opt; break;
                                     }
                                 }
-                                // Fire all events Greenhouse/Lever React listens to
-                                ['input','change','blur'].forEach(ev => {
-                                    sel.dispatchEvent(new Event(ev, {bubbles:true,cancelable:true}));
-                                    sel.dispatchEvent(new InputEvent(ev, {bubbles:true,cancelable:true}));
+                                // Fallback: first real option
+                                if (!matched_opt) {
+                                    for (let opt of sel.options) {
+                                        if (opt.value && opt.value !== '0' && opt.value !== '') {
+                                            matched_opt = opt; break;
+                                        }
+                                    }
+                                }
+                                if (!matched_opt) return;
+                                // Reset React's value tracker so it sees the change
+                                try {
+                                    const tracker = sel._valueTracker;
+                                    if (tracker) tracker.setValue('');
+                                } catch(e) {}
+                                // Use native setter — bypasses React synthetic event system
+                                const nativeSetter = Object.getOwnPropertyDescriptor(
+                                    HTMLSelectElement.prototype, 'value').set;
+                                nativeSetter.call(sel, matched_opt.value);
+                                matched_opt.selected = true;
+                                // Fire all events React/Greenhouse listens to
+                                ['input', 'change', 'blur'].forEach(ev => {
+                                    sel.dispatchEvent(new Event(ev, {bubbles:true, cancelable:true}));
+                                    sel.dispatchEvent(new InputEvent(ev, {bubbles:true, cancelable:true}));
                                 });
                             }
                         """, {"el": sel_el.element_handle(), "val": target_value, "lbl": target_label})
                     except Exception: pass
 
-                    _jitter(0.3, 0.5)
+                    _jitter(0.4, 0.7)  # give React time to re-render after events
 
                     # Verify it stuck
                     new_val = (sel_el.input_value() or "").strip()
