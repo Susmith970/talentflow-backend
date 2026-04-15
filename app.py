@@ -17,6 +17,31 @@ load_dotenv(Path(__file__).parent / ".env")  # .env sits next to app.py at root
 
 import db
 
+# ── Rate limiting (in-memory, per user) ──────────────────────────────────────
+_rate_limits: dict = {}
+_rate_lock = threading.Lock()
+
+def _check_rate(username: str, action: str, max_calls: int, window_secs: int) -> bool:
+    now = time.time()
+    with _rate_lock:
+        user  = _rate_limits.setdefault(username, {})
+        calls = [t for t in user.get(action, []) if now - t < window_secs]
+        if len(calls) >= max_calls: return False
+        calls.append(now); user[action] = calls; return True
+
+TIERS = {
+    "free":  {"scrapes_per_day": 3,  "applies_per_day": 5,  "resumes_per_day": 10},
+    "pro":   {"scrapes_per_day": 20, "applies_per_day": 50, "resumes_per_day": 100},
+    "agent": {"scrapes_per_day": 99, "applies_per_day": 999,"resumes_per_day": 999},
+}
+
+def get_tier(username: str) -> str:
+    p = db.get_profile(username)
+    return (p or {}).get("subscription_tier", "free")
+
+def tier_limits(username: str) -> dict:
+    return TIERS.get(get_tier(username), TIERS["free"])
+
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET", "talentflow-dev-change-in-prod")
 
@@ -315,6 +340,9 @@ def start_scrape():
 
     if _scrape_progress.get(u,{}).get("running"):
         return jsonify({"error": "Scrape already running"}), 409
+    lim = tier_limits(u)
+    if not _check_rate(u, "scrape", lim["scrapes_per_day"], 86400):
+        return jsonify({"error": f"Daily limit: {lim['scrapes_per_day']} scrapes/day. Upgrade to Pro for more."}), 429
 
     _scrape_progress[u] = {"running":True,"current_source":"","found":0,"done":False}
     db.log(u, f"Scrape started: {roles}")
@@ -693,6 +721,81 @@ def apply_from_url():
         "reason":          result.get("reason",""),
         "apply_url":       result.get("apply_url", url),
     })
+
+
+# ── Stripe / Subscriptions ───────────────────────────────────────────────────
+
+@app.post("/api/billing/create-checkout")
+def create_checkout():
+    u = require_auth()
+    try:
+        import stripe
+        stripe.api_key = os.environ.get("STRIPE_SECRET_KEY","")
+        if not stripe.api_key:
+            return jsonify({"error":"Billing not configured — contact support"}), 503
+        body     = request.json or {}
+        plan     = body.get("plan","pro")
+        prices   = {"pro": os.environ.get("STRIPE_PRICE_PRO",""),
+                    "agent": os.environ.get("STRIPE_PRICE_AGENT","")}
+        price_id = prices.get(plan)
+        if not price_id:
+            return jsonify({"error":"Invalid plan"}), 400
+        profile  = db.get_profile(u) or {}
+        frontend = os.environ.get("FRONTEND_URL","https://talentflow-frontend-ten.vercel.app")
+        session_obj = stripe.checkout.Session.create(
+            payment_method_types=["card"], mode="subscription",
+            customer_email=profile.get("email",""),
+            metadata={"username": u, "plan": plan},
+            line_items=[{"price": price_id, "quantity": 1}],
+            success_url=f"{frontend}?billing=success&plan={plan}",
+            cancel_url=f"{frontend}?billing=cancelled",
+        )
+        return jsonify({"ok": True, "url": session_obj.url})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.post("/api/billing/webhook")
+def stripe_webhook():
+    try:
+        import stripe
+        stripe.api_key  = os.environ.get("STRIPE_SECRET_KEY","")
+        webhook_secret  = os.environ.get("STRIPE_WEBHOOK_SECRET","")
+        payload         = request.get_data()
+        sig             = request.headers.get("Stripe-Signature","")
+        if webhook_secret:
+            try: event = stripe.Webhook.construct_event(payload, sig, webhook_secret)
+            except Exception: return jsonify({"error":"Invalid signature"}), 400
+        else:
+            event = json.loads(payload)
+        etype = event.get("type","")
+        obj   = event.get("data",{}).get("object",{})
+        if etype in ("checkout.session.completed","customer.subscription.updated"):
+            meta = obj.get("metadata",{})
+            username = meta.get("username",""); plan = meta.get("plan","pro")
+            if username:
+                db.update_profile(username, {"subscription_tier": plan,
+                    "subscription_status": "active",
+                    "subscription_updated": datetime.now().isoformat()})
+                print(f"  [billing] {username} → {plan}")
+        elif etype == "customer.subscription.deleted":
+            meta = obj.get("metadata",{})
+            username = meta.get("username","")
+            if username:
+                db.update_profile(username, {"subscription_tier": "free",
+                    "subscription_status": "cancelled"})
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.get("/api/billing/status")
+def billing_status():
+    u = require_auth()
+    profile = db.get_profile(u) or {}
+    tier    = profile.get("subscription_tier","free")
+    return jsonify({"tier": tier, "limits": tier_limits(u),
+                    "status": profile.get("subscription_status","")})
 
 
 # ── Activity & health ─────────────────────────────────────────────────────────

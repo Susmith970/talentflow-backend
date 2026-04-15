@@ -1232,271 +1232,330 @@ def _greenhouse_api(job, profile, username, board, job_id):
 
 def _greenhouse_playwright(job: dict, profile: dict, username: str,
                             apply_url: str) -> dict:
-    """Greenhouse via Playwright browser with full diagnostic logging."""
+    """Greenhouse via Playwright — handles multi-page forms, radios, selects."""
     sp, _ = _pw()
     if not sp:
-        db.log(username, "  [PW] Playwright not installed — cannot use browser fallback")
+        db.log(username, "  [PW] Playwright not installed")
         return _nope("greenhouse", "Playwright not installed", job)
 
-    def L(msg):
-        db.log(username, f"  [PW] {msg}")
+    def L(msg): db.log(username, f"  [PW] {msg}")
 
     cover      = _cover_letter(profile, job)
     name_parts = (profile.get("name", "") or "Candidate").split()
     resume_path = job.get("resume_path") or profile.get("base_resume_path", "")
 
-    L(f"Launching Chromium headless for: {apply_url[:80]}")
+    L(f"Opening: {apply_url[:80]}")
 
     with sp() as p:
-        browser = p.chromium.launch(headless=True, args=["--no-sandbox","--disable-dev-shm-usage"])
-        page    = browser.new_page()
+        browser = p.chromium.launch(headless=True,
+            args=["--no-sandbox","--disable-dev-shm-usage","--disable-blink-features=AutomationControlled"])
+        ctx  = browser.new_context(user_agent=(
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"))
+        page = ctx.new_page()
         try:
             page.goto(apply_url, wait_until="domcontentloaded", timeout=30000)
-            _jitter(1.5, 2.5)
-            L(f"Page loaded: {page.url[:80]}")
-            L(f"Page title: {page.title()[:60]}")
+            _jitter(2, 3)
+            L(f"Loaded: {page.title()[:60]}")
+            L(f"URL: {page.url[:80]}")
 
-            # Detect if page is actually an application form
-            form_count = page.locator("form").count()
-            input_count = page.locator("input:visible").count()
-            L(f"Found: {form_count} form(s), {input_count} visible input(s)")
+            # ── Page loop — handle multi-page forms ───────────────────────
+            for page_num in range(1, 6):  # max 5 pages
+                L(f"--- Page {page_num} ---")
+                input_count = page.locator("input:visible").count()
+                L(f"Visible inputs: {input_count}")
 
-            if input_count == 0:
-                L("WARNING: No visible inputs found — may not be on the application form")
+                # 1. Resume upload
+                if resume_path and Path(resume_path).exists():
+                    for fi_sel in ("#resume","input[id*=resume]","input[name*=resume]"):
+                        fi = page.locator(fi_sel)
+                        if fi.count() > 0:
+                            try:
+                                fi.first.set_input_files(resume_path)
+                                L(f"✓ Resume uploaded via {fi_sel}")
+                                _jitter(2, 3)
+                                break
+                            except Exception: pass
 
-            # ── Standard Greenhouse field IDs ──────────────────────────────
-            std = {
-                "#first_name":                   name_parts[0] if name_parts else "",
-                "#last_name":                    " ".join(name_parts[1:]) if len(name_parts) > 1 else "",
-                "#email":                        profile.get("email", ""),
-                "#phone":                        profile.get("phone", ""),
-                "#job_application_location":     profile.get("location", ""),
-                "#job_application_linkedin_url": _fmt_url(profile.get("linkedin", ""), "https://linkedin.com/in/"),
-                "#job_application_website":      profile.get("website", ""),
-                "input[id*='github']":           _fmt_url(profile.get("github", ""), "https://github.com/"),
-            }
-            filled_std = []
-            skipped_std = []
-            for sel, val in std.items():
-                if not val:
-                    skipped_std.append(sel)
-                    continue
-                try:
-                    el = page.locator(sel)
-                    if el.count() > 0:
-                        try:
-                            el.first.fill(str(val))
-                            filled_std.append(f"{sel}={val[:30]}")
-                            _jitter(0.1, 0.3)
-                        except Exception as fe:
-                            skipped_std.append(f"{sel} (fill error: {fe})")
-                    else:
-                        skipped_std.append(f"{sel} (not found)")
-                except Exception:
-                    pass
-
-            L(f"Standard fields filled: {len(filled_std)}")
-            for f_ in filled_std:
-                L(f"  ✓ {f_}")
-            if skipped_std:
-                L(f"  Skipped (not on page): {len(skipped_std)}")
-
-            # ── Resume upload ──────────────────────────────────────────────
-            if resume_path and Path(resume_path).exists():
-                L(f"Resume path: {resume_path}")
-                resume_uploaded = False
-                for fi_sel in ("#resume", "input[id*=resume]", "input[name*=resume]", "input[type=file]"):
-                    fi = page.locator(fi_sel)
-                    cnt = fi.count()
-                    if cnt > 0:
-                        try:
-                            fi.first.set_input_files(resume_path)
-                            L(f"  ✓ Resume uploaded via selector: {fi_sel}")
-                            resume_uploaded = True
-                            _jitter(2, 3)
-                            break
-                        except Exception as ue:
-                            L(f"  ✗ Resume upload failed ({fi_sel}): {ue}")
-                if not resume_uploaded:
-                    L("  ✗ Could not upload resume — no matching file input found")
-            else:
-                L(f"  ✗ Resume file missing or path invalid: {resume_path}")
-
-            # ── Cover letter ─────────────────────────────────────────────────
-            # IMPORTANT: some forms use #cover_letter for a FILE input not textarea.
-            # Only fill if the element is actually a textarea or text input.
-            cl_filled = False
-            cl_selectors = [
-                "textarea[id*=cover]",
-                "textarea[name*=cover]",
-                "textarea[placeholder*=cover i]",
-                "textarea[aria-label*=cover i]",
-                # #cover_letter only if it is NOT a file input
-            ]
-            # Also check #cover_letter explicitly but verify it's not file type
-            for cl_sel in cl_selectors:
-                cl = page.locator(cl_sel)
-                if cl.count() > 0:
+                # 2. Standard Greenhouse named fields
+                std = {
+                    "#first_name":  name_parts[0] if name_parts else "",
+                    "#last_name":   " ".join(name_parts[1:]) if len(name_parts)>1 else "",
+                    "#email":       profile.get("email",""),
+                    "#phone":       profile.get("phone",""),
+                    "#job_application_location": profile.get("location",""),
+                    "#job_application_linkedin_url": _fmt_url(profile.get("linkedin",""), "https://linkedin.com/in/"),
+                }
+                filled_std = []
+                for sel, val in std.items():
+                    if not val: continue
                     try:
-                        cl.first.fill(cover[:2000])
-                        L(f"  ✓ Cover letter filled via {cl_sel} ({len(cover)} chars)")
-                        cl_filled = True
-                        break
-                    except Exception as ce:
-                        L(f"  ✗ Cover letter fill error ({cl_sel}): {ce}")
-            # Try #cover_letter only if it's not a file input
-            if not cl_filled:
-                cl = page.locator("#cover_letter")
-                if cl.count() > 0:
-                    el_type = cl.first.get_attribute("type") or "textarea"
-                    if el_type.lower() != "file":
+                        el = page.locator(sel)
+                        if el.count() > 0 and el.first.is_visible():
+                            curr = el.first.input_value() or ""
+                            if not curr.strip():
+                                el.first.fill(str(val))
+                                filled_std.append(f"{sel}={val[:20]}")
+                                _jitter(0.1, 0.3)
+                    except Exception: pass
+                if filled_std: L(f"Std fields: {', '.join(filled_std)}")
+
+                # 3. Cover letter (textarea only — never file inputs)
+                for cl_sel in ("textarea[id*=cover]","textarea[name*=cover]",
+                               "textarea[placeholder*=cover i]","textarea[aria-label*=cover i]"):
+                    cl = page.locator(cl_sel)
+                    if cl.count() > 0:
                         try:
                             cl.first.fill(cover[:2000])
-                            L(f"  ✓ Cover letter filled via #cover_letter ({len(cover)} chars)")
-                            cl_filled = True
-                        except Exception as ce:
-                            L(f"  ✗ Cover letter fill error (#cover_letter): {ce}")
-                    else:
-                        L(f"  ℹ #cover_letter is a file input — skipping text fill")
-            if not cl_filled:
-                L("  Cover letter textarea not found (not required or not visible)")
-
-            # ── Fill all other fields via _fill_form ───────────────────────
-            L("Running _fill_form() for remaining fields…")
-            _fill_form_logged(page, profile, job, cover, username)
-
-            # ── Capture all visible input values pre-submit for audit ──────
-            try:
-                filled_state = []
-                empty_required = []
-                for inp in page.locator("input:visible, select:visible, textarea:visible").all()[:30]:
-                    try:
-                        itype = inp.get_attribute("type") or ""
-                        if itype == "file": continue
-                        label_txt = _get_label(page, inp) or inp.get_attribute("placeholder") or inp.get_attribute("name") or inp.get_attribute("aria-label") or "?"
-                        val_txt   = inp.input_value() or ""
-                        is_req    = inp.get_attribute("required") is not None or inp.get_attribute("aria-required") == "true"
-                        if val_txt:
-                            filled_state.append(f"{label_txt[:25]}={val_txt[:25]}")
-                        elif is_req:
-                            empty_required.append(label_txt[:40])
-                    except Exception:
-                        pass
-                L(f"Pre-submit form state ({len(filled_state)} filled fields):")
-                for s_ in filled_state:
-                    L(f"  · {s_}")
-                if empty_required:
-                    L(f"  ⚠ Required fields still EMPTY ({len(empty_required)}) — form may not submit:")
-                    for er in empty_required:
-                        L(f"    ✗ {er}")
-            except Exception:
-                pass
-
-            # ── Find and click submit ──────────────────────────────────────
-            sub_selectors = [
-                "button[type=submit]:has-text('Submit')",
-                "button:has-text('Submit Application')",
-                "button:has-text('Submit my application')",
-                "input[type=submit][value*='Submit']",
-                "button[type=submit]",
-            ]
-            sub = None
-            for sub_sel in sub_selectors:
-                try:
-                    el = page.locator(sub_sel)
-                    if el.count() > 0 and el.first.is_visible():
-                        sub = el.first
-                        L(f"Submit button found: {sub_sel}")
-                        L(f"  Button text: {el.first.text_content()[:40]}")
-                        break
-                except Exception:
-                    pass
-
-            if sub:
-                try:
-                    sub.click()
-                    L("Submit button clicked — waiting for response…")
-                    _jitter(4, 6)
-                    L(f"Post-submit URL: {page.url[:80]}")
-                    L(f"Post-submit title: {page.title()[:60]}")
-
-                    # Scroll to top to reveal any validation errors
-                    try:
-                        page.evaluate("window.scrollTo(0,0)")
-                        _jitter(1, 1.5)
-                    except Exception:
-                        pass
-
-                    # Check for validation errors FIRST (form didn't submit)
-                    error_texts = []
-                    for err_sel in (".error:visible", ".field-error:visible",
-                                    "[class*=error]:visible", "[aria-invalid=true]:visible",
-                                    ".alert-error:visible", "#error_explanation:visible"):
-                        try:
-                            errs = page.locator(err_sel).all()
-                            for e in errs[:5]:
-                                t = (e.inner_text() or "").strip()
-                                if t: error_texts.append(t[:80])
-                        except Exception:
-                            pass
-                    if error_texts:
-                        L(f"  ✗ VALIDATION ERRORS — form was NOT submitted:")
-                        for et in error_texts:
-                            L(f"    → {et}")
-
-                    # Check page content for confirmation
-                    page_text = page.inner_text("body") if page.locator("body").count() > 0 else ""
-                    success_phrases = ["Thank you","thank you","Application received",
-                                       "application complete","We have received","Successfully submitted",
-                                       "application submitted","You applied","check your email"]
-                    url_success_keys = ["thank","confirm","success","applied","complete"]
-
-                    found_phrase = next((ph for ph in success_phrases if ph.lower() in page_text.lower()), None)
-                    found_url_key = next((k for k in url_success_keys if k in page.url.lower()), None)
-
-                    if found_phrase:
-                        L(f"  ✓ SUCCESS confirmed by page text: '{found_phrase}'")
-                        confirmed = True
-                    elif found_url_key:
-                        L(f"  ✓ SUCCESS confirmed by URL keyword: '{found_url_key}'")
-                        confirmed = True
-                    else:
-                        L(f"  ~ Cannot confirm success from page text or URL")
-                        L(f"  Page text snippet: {page_text[:200]}")
-                        confirmed = False
-
-                    browser.close()
-                    if confirmed:
-                        return {"success": True, "platform": "greenhouse", "manual": False}
-                    # Return success=True but flag as unconfirmed so UI shows warning
-                    return {"success": True, "platform": "greenhouse", "manual": False,
-                            "note": "Submitted but could not confirm — check your email"}
-
-                except Exception as click_err:
-                    L(f"  ✗ Submit click failed: {click_err}")
-                    browser.close()
-                    return _nope("greenhouse", f"Submit click error: {click_err}", job)
-            else:
-                # Log all buttons for debugging
-                try:
-                    btns = page.locator("button:visible").all()
-                    L(f"No submit button found. All visible buttons ({len(btns)}):")
-                    for btn in btns[:10]:
-                        try: L(f"  btn: '{btn.text_content()[:40]}'")
+                            L(f"✓ Cover letter filled")
+                            break
                         except Exception: pass
-                except Exception:
-                    pass
-                browser.close()
-                return _nope("greenhouse", "Submit button not found on page", job)
+
+                # 4. Full form fill (text, select, radio, checkbox)
+                _fill_all(page, profile, job, cover, username)
+
+                # 5. Pre-submit audit
+                _audit_form(page, username)
+
+                # 6. Look for Next or Submit
+                next_btn = None
+                submit_btn = None
+
+                for next_sel in ["button:has-text('Next')","button:has-text('Continue')",
+                                 "button[type=button]:has-text('Next')"]:
+                    try:
+                        el = page.locator(next_sel)
+                        if el.count() > 0 and el.first.is_visible():
+                            next_btn = el.first
+                            L(f"Found Next button: {el.first.text_content()[:30]}")
+                            break
+                    except Exception: pass
+
+                for sub_sel in ["button[type=submit]:has-text('Submit')",
+                                "button:has-text('Submit Application')",
+                                "button:has-text('Submit my application')",
+                                "input[type=submit]","button[type=submit]"]:
+                    try:
+                        el = page.locator(sub_sel)
+                        if el.count() > 0 and el.first.is_visible():
+                            submit_btn = el.first
+                            L(f"Found Submit: {el.first.text_content()[:30]}")
+                            break
+                    except Exception: pass
+
+                if submit_btn and not next_btn:
+                    # Submit the form
+                    submit_btn.click()
+                    L("Submit clicked — waiting…")
+                    _jitter(4, 6)
+
+                    try: page.evaluate("window.scrollTo(0,0)")
+                    except Exception: pass
+
+                    # Check for validation errors
+                    errors = _get_errors(page)
+                    if errors:
+                        L(f"✗ VALIDATION ERRORS ({len(errors)}):")
+                        for e in errors: L(f"    → {e}")
+                        # Try to fill what's missing and resubmit once
+                        _fill_all(page, profile, job, cover, username)
+                        _jitter(1, 2)
+                        try: submit_btn.click(); _jitter(4, 6)
+                        except Exception: pass
+                        errors2 = _get_errors(page)
+                        if errors2:
+                            L(f"✗ Still {len(errors2)} errors after retry")
+
+                    # Check success
+                    page_text = ""
+                    try: page_text = page.inner_text("body")
+                    except Exception: pass
+                    post_url = page.url
+
+                    success_phrases = ["thank you","application received","successfully submitted",
+                                      "we have received","you applied","application complete",
+                                      "check your email","application submitted"]
+                    url_keys        = ["thank","confirm","success","applied","complete"]
+
+                    confirmed = (any(ph in page_text.lower() for ph in success_phrases)
+                                 or any(k in post_url.lower() for k in url_keys))
+
+                    L(f"Post-submit URL: {post_url[:80]}")
+                    if confirmed:
+                        L("✓ SUCCESS — application submitted")
+                        browser.close()
+                        return {"success":True,"platform":"greenhouse","manual":False}
+                    else:
+                        L(f"~ Submitted (unconfirmed). Page: {page_text[:150]}")
+                        browser.close()
+                        return {"success":True,"platform":"greenhouse","manual":False,
+                                "note":"Submitted — confirm in your email"}
+
+                elif next_btn:
+                    next_btn.click()
+                    L("Next clicked — loading next page…")
+                    _jitter(2, 3)
+                    try: page.wait_for_load_state("domcontentloaded", timeout=10000)
+                    except Exception: pass
+                    continue
+
+                else:
+                    # No button found — log all visible buttons
+                    btns = []
+                    try:
+                        for btn in page.locator("button:visible").all()[:8]:
+                            btns.append(btn.text_content()[:30])
+                    except Exception: pass
+                    L(f"No Next/Submit found. Buttons: {btns}")
+                    browser.close()
+                    return _nope("greenhouse","No submit or next button found",job)
+
+            browser.close()
+            return _nope("greenhouse","Exceeded max page depth (5)",job)
 
         except Exception as e:
             import traceback
-            tb = traceback.format_exc()[-300:]
-            L(f"Playwright exception: {e}")
-            L(f"Traceback: {tb}")
+            L(f"Exception: {e}")
+            L(traceback.format_exc()[-400:])
             try: browser.close()
             except Exception: pass
-            return _nope("greenhouse", str(e)[:200], job)
+            return _nope("greenhouse",str(e)[:200],job)
+
+
+def _fill_all(page, profile: dict, job: dict, cover: str, username: str):
+    """Fill every visible field: text, select, radio, checkbox."""
+    def L(msg): db.log(username, f"  [FF] {msg}")
+    name_parts = (profile.get("name","") or "").split()
+    BAD_URLS   = ("railway","vercel","heroku","render.com","localhost")
+    filled = []
+
+    # ── Text inputs ──────────────────────────────────────────────────────────
+    for inp in page.locator(
+        "input[type=text]:visible,input[type=email]:visible,"
+        "input[type=tel]:visible,input[type=number]:visible,"
+        "input[type=url]:visible,input:not([type]):visible"
+    ).all():
+        try:
+            if not inp.is_visible() or inp.is_disabled(): continue
+            if (inp.input_value() or "").strip(): continue
+            itype = (inp.get_attribute("type") or "text").lower()
+            if itype == "file": continue
+            attrs = " ".join(filter(None,[
+                inp.get_attribute("id") or "",
+                inp.get_attribute("name") or "",
+                inp.get_attribute("aria-label") or "",
+                inp.get_attribute("placeholder") or "",
+            ])).lower()
+            label    = _get_label(page, inp) or ""
+            combined = (attrs+" "+label).lower()
+            val      = _answer(label or combined, profile)
+            if val and any(b in str(val).lower() for b in BAD_URLS): val=""
+            if val:
+                inp.fill(str(val)); filled.append(f"{label[:20] or attrs[:20]}={str(val)[:15]}")
+                _jitter(0.05, 0.15)
+        except Exception: pass
+
+    # ── Select dropdowns ─────────────────────────────────────────────────────
+    for sel_el in page.locator("select:visible").all():
+        try:
+            if not sel_el.is_visible() or sel_el.is_disabled(): continue
+            if (sel_el.input_value() or "").strip() not in ("","Select","-- Select --"): continue
+            label    = _get_label(page, sel_el) or sel_el.get_attribute("name") or ""
+            combined = label.lower()
+            val      = _answer(combined, profile)
+            if not val: continue
+            opts = sel_el.locator("option").all()
+            matched = None
+            for opt in opts:
+                ot = (opt.inner_text() or "").strip()
+                if not ot or ot.lower() in ("select","-- select --","choose"): continue
+                if val.lower() in ot.lower() or ot.lower() in val.lower():
+                    matched = ot; break
+            if matched:
+                sel_el.select_option(label=matched)
+                filled.append(f"{label[:20]}(sel)={matched[:15]}")
+                _jitter(0.1, 0.2)
+        except Exception: pass
+
+    # ── Radio buttons ────────────────────────────────────────────────────────
+    # Group by name attribute and pick the right option
+    radio_names_done = set()
+    for radio in page.locator("input[type=radio]:visible").all():
+        try:
+            rname = radio.get_attribute("name") or ""
+            if rname in radio_names_done: continue
+            # Get label for this radio group
+            label    = _get_label(page, radio) or ""
+            group_label = rname.lower().replace("_"," ").replace("-"," ")
+            combined = (label+" "+group_label).lower()
+            val      = _answer(combined, profile)
+            if not val: continue
+            # Find all radios in this group
+            group = page.locator(f"input[type=radio][name={repr(rname)}]").all()
+            for r in group:
+                try:
+                    r_label = _get_label(page, r) or r.get_attribute("value") or ""
+                    if val.lower() in r_label.lower() or r_label.lower() in val.lower():
+                        if not r.is_checked():
+                            r.click(); _jitter(0.1, 0.2)
+                            filled.append(f"{rname[:20]}(radio)={r_label[:15]}")
+                        radio_names_done.add(rname)
+                        break
+                except Exception: pass
+        except Exception: pass
+
+    # ── Checkboxes ───────────────────────────────────────────────────────────
+    for chk in page.locator("input[type=checkbox]:visible").all():
+        try:
+            label = _get_label(page, chk) or chk.get_attribute("aria-label") or ""
+            ll    = label.lower()
+            # Auto-check: background check consent, terms, privacy, EEO
+            auto_check = any(x in ll for x in (
+                "background","drug","authorize","i agree","i confirm",
+                "terms","privacy","certify","acknowledge","eeo","voluntary"))
+            if auto_check and not chk.is_checked():
+                chk.click(); _jitter(0.1, 0.2)
+                filled.append(f"checkbox={label[:25]}")
+        except Exception: pass
+
+    if filled: L(f"Filled {len(filled)}: {', '.join(filled[:8])}")
+
+
+def _audit_form(page, username: str):
+    """Log filled vs empty required fields before submit."""
+    def L(msg): db.log(username, f"  [AUDIT] {msg}")
+    try:
+        filled, empty_req = [], []
+        for inp in page.locator("input:visible,select:visible,textarea:visible").all()[:30]:
+            try:
+                itype = inp.get_attribute("type") or ""
+                if itype in ("file","hidden","submit"): continue
+                label = _get_label(page, inp) or inp.get_attribute("placeholder") or inp.get_attribute("name") or "?"
+                val   = inp.input_value() or ""
+                is_req = (inp.get_attribute("required") is not None or
+                          inp.get_attribute("aria-required")=="true")
+                if val: filled.append(f"{label[:20]}={val[:15]}")
+                elif is_req: empty_req.append(label[:30])
+            except Exception: pass
+        L(f"Filled: {len(filled)} fields")
+        for f in filled[:10]: L(f"  ✓ {f}")
+        if empty_req:
+            L(f"Empty required: {len(empty_req)}")
+            for e in empty_req: L(f"  ✗ {e}")
+    except Exception: pass
+
+
+def _get_errors(page) -> list:
+    """Return visible validation error messages."""
+    errors = []
+    for sel in (".error:visible",".field-error:visible","[class*=error]:visible",
+                "[aria-invalid=true]",".alert-danger:visible","#error_explanation:visible"):
+        try:
+            for el in page.locator(sel).all()[:5]:
+                t = (el.inner_text() or "").strip()
+                if t and t not in errors: errors.append(t[:80])
+        except Exception: pass
+    return errors
 
 
 def _fill_form_logged(page, profile: dict, job: dict, cover: str, username: str):
