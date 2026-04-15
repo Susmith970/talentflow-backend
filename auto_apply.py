@@ -166,7 +166,8 @@ def _answer(question: str, profile: dict) -> str:
     # ── Address ──────────────────────────────────────────────────────────────
     if any(x in q for x in ("street address","address line 1","address1","street")):
         return profile.get("address_line1","") or profile.get("location","")
-    if any(x in q for x in ("city","town","municipality")):
+    # Word boundary check — "city" must not match inside "ethnicity"
+    if re.search(r'\bcity\b|\btown\b|\bmunicipality\b', q):
         city = profile.get("address_city","")
         if not city:
             loc = profile.get("location","")
@@ -231,7 +232,8 @@ def _answer(question: str, profile: dict) -> str:
     # ── Work authorization ────────────────────────────────────────────────────
     if any(x in q for x in ("authorized to work","eligible to work","legally authorized",
                               "right to work","work authorization","work in the us",
-                              "work in the united states","permitted to work")):
+                              "work in the united states","permitted to work",
+                              "unrestricted right","do you have the unrestricted")):
         return profile.get("work_authorized","Yes")
     if any(x in q for x in ("require sponsorship","need sponsorship","visa sponsorship",
                               "will you require","will you now","at any time","future require",
@@ -302,9 +304,11 @@ def _answer(question: str, profile: dict) -> str:
         return edu[0].get("school","") if edu else ""
 
     # ── EEO / Demographic ────────────────────────────────────────────────────
-    if any(x in q for x in ("veteran","military service","military status","protected veteran")):
+    if any(x in q for x in ("veteran","military service","military status","protected veteran",
+                              "what is your military","armed forces","military history")):
         return profile.get("veteran_status","I am not a veteran")
-    if any(x in q for x in ("disability","disabled","accommodation")):
+    if any(x in q for x in ("disability","disabled","accommodation",
+                              "what is your disability","disability status","disability or impairment")):
         return profile.get("disability_status","I do not have a disability")
     if re.search(r"gender|sex", q):
         return profile.get("gender","Prefer not to say")
@@ -330,7 +334,9 @@ def _answer(question: str, profile: dict) -> str:
     # ── Generic yes/no defaults ───────────────────────────────────────────────
     yes_patterns = ["agree","consent","acknowledge","confirm","understand",
                     "18 years","18 or older","us person","willing","able to",
-                    "available","authorized","eligible"]
+                    "available","authorized","eligible",
+                    "adheres to","please review","i have read","certify","attest",
+                    "robinhood adheres","please review and acknowledge"]
     if any(x in q for x in yes_patterns):
         return "Yes"
 
@@ -1728,11 +1734,13 @@ def _fill_all(page, profile: dict, job: dict, cover: str, username: str):
                 if best_score >= 70:
                     break  # good enough match found — stop trying more candidates
 
-            # If no match found and field is required → ask Claude to pick an option
-            if not matched_label and not matched_value:
+            # If no match found OR low-confidence match → ask Claude for required fields
+            html_req_sel = sel_el.get_attribute("required") is not None
+            aria_req_sel = sel_el.get_attribute("aria-required") == "true"
+            if (not matched_label and not matched_value) or (best_score < 50 and (html_req_sel or aria_req_sel)):
                 try:
-                    html_req = sel_el.get_attribute("required") is not None
-                    aria_req = sel_el.get_attribute("aria-required") == "true"
+                    html_req = html_req_sel
+                    aria_req = aria_req_sel
                     if (html_req or aria_req) and opt_pairs:
                         opt_labels = [ot for ot,_ in opt_pairs]
                         claude_pick = _claude_answer(
@@ -1750,46 +1758,88 @@ def _fill_all(page, profile: dict, job: dict, cover: str, username: str):
 
             if matched_label or matched_value:
                 try:
-                    # Try by value first (more reliable), then by label
-                    if matched_value:
-                        sel_el.select_option(value=matched_value)
-                    else:
-                        sel_el.select_option(label=matched_label)
-                    # Trigger change event so Greenhouse/Lever JS picks it up
+                    target_value = matched_value or matched_label
+                    target_label = matched_label or matched_value
+
+                    # Method 1: Playwright select_option
                     try:
-                        sel_el.dispatch_event("change")
-                        sel_el.dispatch_event("input")
+                        if matched_value:
+                            sel_el.select_option(value=matched_value)
+                        else:
+                            sel_el.select_option(label=matched_label)
                     except Exception: pass
-                    _jitter(0.2, 0.4)
+
+                    # Method 2: Force via JavaScript (handles React/Vue controlled selects)
+                    try:
+                        page.evaluate("""
+                            (args) => {
+                                const sel = args.el;
+                                const val = args.val;
+                                const lbl = args.lbl;
+                                // Try matching by value first, then text
+                                for (let opt of sel.options) {
+                                    if (opt.value === val || opt.text.trim() === lbl ||
+                                        opt.text.toLowerCase().includes(lbl.toLowerCase()) ||
+                                        lbl.toLowerCase().includes(opt.text.trim().toLowerCase())) {
+                                        sel.value = opt.value;
+                                        opt.selected = true;
+                                        break;
+                                    }
+                                }
+                                // Fire all events Greenhouse/Lever React listens to
+                                ['input','change','blur'].forEach(ev => {
+                                    sel.dispatchEvent(new Event(ev, {bubbles:true,cancelable:true}));
+                                    sel.dispatchEvent(new InputEvent(ev, {bubbles:true,cancelable:true}));
+                                });
+                            }
+                        """, {"el": sel_el.element_handle(), "val": target_value, "lbl": target_label})
+                    except Exception: pass
+
+                    _jitter(0.3, 0.5)
+
                     # Verify it stuck
                     new_val = (sel_el.input_value() or "").strip()
-                    if new_val and new_val not in skip_vals:
-                        filled.append(f"{label[:20]}(sel)={matched_label[:15] if matched_label else new_val[:15]}")
+                    if new_val and new_val.lower() not in skip_vals:
+                        filled.append(f"{label[:20]}(sel)={target_label[:15]}")
+                        L(f"  ✓ select '{label[:25]}' = '{target_label[:20]}'")
                     else:
-                        # JS reset it — try clicking the option directly
-                        try:
-                            sel_el.select_option(index=opts.index(
-                                next(o for o in opts if
-                                     (opt.inner_text() or "").strip() == matched_label))+1
-                            )
-                        except Exception: pass
+                        L(f"  ✗ select '{label[:25]}' didn't stick (JS reset?) val='{new_val}'")
                 except Exception as se:
-                    pass
+                    L(f"  ✗ select error: {se}")
         except Exception: pass
 
     # ── Radio buttons ────────────────────────────────────────────────────────
-    # Group by name attribute and pick the right option
     radio_names_done = set()
     for radio in page.locator("input[type=radio]:visible").all():
         try:
             rname = radio.get_attribute("name") or ""
             if rname in radio_names_done: continue
-            # Get label for this radio group
-            label    = _get_label(page, radio) or ""
+            label       = _get_label(page, radio) or ""
             group_label = rname.lower().replace("_"," ").replace("-"," ")
-            combined = (label+" "+group_label).lower()
-            val      = _answer(combined, profile)
+            combined    = (label+" "+group_label).lower()
+            val         = _answer(combined, profile)
+
+            # If no answer, check if required and ask Claude
+            if not val:
+                try:
+                    # Get all options in this radio group to give Claude context
+                    group_opts = page.locator(f"input[type=radio][name={repr(rname)}]").all()
+                    opt_labels = []
+                    for ro in group_opts:
+                        rl = _get_label(page, ro) or ro.get_attribute("value") or ""
+                        if rl: opt_labels.append(rl)
+                    if opt_labels:
+                        is_req = (radio.get_attribute("required") is not None or
+                                  radio.get_attribute("aria-required") == "true")
+                        if is_req:
+                            val = _claude_answer(
+                                f"{label or group_label} (choose one: {', '.join(opt_labels[:6])})",
+                                "radio", profile, job)
+                            if val: L(f"Claude answered radio '{(label or group_label)[:30]}' = '{val[:30]}'")
+                except Exception: pass
+
             if not val: continue
+
             # Find all radios in this group
             group = page.locator(f"input[type=radio][name={repr(rname)}]").all()
             for r in group:
