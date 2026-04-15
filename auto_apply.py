@@ -1631,6 +1631,8 @@ def _fill_form_logged(page, profile: dict, job: dict, cover: str, username: str)
 # ── Lever ──────────────────────────────────────────────────────────────────────
 
 def apply_lever(job: dict, profile: dict, username: str) -> dict:
+    """Lever application via Playwright with full verification."""
+    def L(msg): db.log(username, f"  [Lever] {msg}")
     db.log(username, f"[Lever] {job.get('title')} @ {job.get('company')}")
     sp, _ = _pw()
     if not sp:
@@ -1642,80 +1644,178 @@ def apply_lever(job: dict, profile: dict, username: str) -> dict:
     if "/apply" not in apply_url:
         apply_url = apply_url.rstrip("/") + "/apply"
 
-    cover      = _cover_letter(profile, job)
+    cover       = _cover_letter(profile, job)
     resume_path = job.get("resume_path") or profile.get("base_resume_path", "")
+    BAD_URLS    = ("railway","vercel","heroku","render.com","localhost")
+
+    L(f"URL: {apply_url[:80]}")
 
     with sp() as p:
-        browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
-        page    = browser.new_page()
+        browser = p.chromium.launch(headless=True,
+            args=["--no-sandbox","--disable-dev-shm-usage",
+                  "--disable-blink-features=AutomationControlled"])
+        ctx  = browser.new_context(user_agent=(
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"))
+        page = ctx.new_page()
         try:
-            page.goto(apply_url, wait_until="domcontentloaded", timeout=25000)
-            _jitter(1, 2)
+            page.goto(apply_url, wait_until="domcontentloaded", timeout=30000)
+            _jitter(2, 3)
+            L(f"Page: {page.title()[:50]}")
 
-            # Standard Lever fields
+            # ── 1. Standard Lever named fields ────────────────────────────
             std = [
-                (["input[name='name']",   "input[id='name']"],   profile.get("name", "")),
-                (["input[name='email']",  "input[type=email]"],  profile.get("email", "")),
-                (["input[name='phone']",  "input[type=tel]"],    profile.get("phone", "")),
-                (["input[name='org']",    "input[name='current_company']"],
-                 profile.get("current_company", "")),
+                (["input[name='name']","input[id='name']"],
+                 profile.get("name","")),
+                (["input[name='email']","input[type=email]"],
+                 profile.get("email","")),
+                (["input[name='phone']","input[type=tel]"],
+                 profile.get("phone","")),
+                (["input[name='org']","input[name='current_company']"],
+                 profile.get("current_company","")),
                 (["input[name='urls[LinkedIn]']"],
-                 _fmt_url(profile.get("linkedin", ""), "https://linkedin.com/in/")),
+                 _fmt_url(profile.get("linkedin",""),"https://linkedin.com/in/")),
                 (["input[name='urls[GitHub]']"],
-                 _fmt_url(profile.get("github", ""), "https://github.com/")),
-                (["input[name='urls[Portfolio]']", "input[name='urls[Website]']"],
-                 profile.get("website", "")),
+                 _fmt_url(profile.get("github",""),"https://github.com/")),
+                (["input[name='urls[Portfolio]']","input[name='urls[Website]']"],
+                 ""),  # intentionally blank — avoid bad URLs
             ]
+            filled_std = []
             for selectors, val in std:
-                if not val: continue
+                if not val or any(b in val.lower() for b in BAD_URLS): continue
                 for sel in selectors:
                     el = page.locator(sel)
                     if el.count() > 0:
-                        _safe_fill(el.first, val)
+                        try:
+                            curr = el.first.input_value() or ""
+                            if not curr.strip():
+                                el.first.fill(str(val))
+                                filled_std.append(f"{sel.split('[')[1].rstrip(']')}={val[:20]}")
+                                _jitter(0.1, 0.3)
+                        except Exception: pass
                         break
+            L(f"Standard fields: {', '.join(filled_std)}")
 
-            # Resume
+            # ── 2. Resume upload ───────────────────────────────────────────
             if resume_path and Path(resume_path).exists():
-                for fi_sel in ("input[type=file]", "input[name='resume']"):
+                uploaded = False
+                for fi_sel in ("input[type=file]","input[name='resume']","input[name='file']"):
                     fi = page.locator(fi_sel)
                     if fi.count() > 0:
                         try:
                             fi.first.set_input_files(resume_path)
-                            _jitter(1.5, 2.5)
+                            L(f"✓ Resume uploaded via {fi_sel}")
+                            uploaded = True
+                            _jitter(2, 3)
                             break
-                        except Exception:
-                            pass
+                        except Exception as ue:
+                            L(f"  Resume upload error ({fi_sel}): {ue}")
+                if not uploaded:
+                    L("✗ Resume upload failed — no file input found")
+            else:
+                L(f"✗ Resume missing: {resume_path}")
 
-            # Cover letter / comments
-            for ta_sel in ("textarea[name='comments']", "textarea[name='cover_letter']",
-                           "textarea[name='message']"):
+            # ── 3. Cover letter ────────────────────────────────────────────
+            for ta_sel in ("textarea[name='comments']","textarea[name='cover_letter']",
+                           "textarea[name='message']","textarea:visible"):
                 ta = page.locator(ta_sel)
                 if ta.count() > 0:
-                    _safe_fill(ta.first, cover)
-                    break
+                    try:
+                        ta.first.fill(cover[:2000])
+                        L("✓ Cover letter filled")
+                        break
+                    except Exception: pass
 
-            # Fill remaining + submit
-            submitted = _fill_form(page, profile, job, cover)
+            # ── 4. Fill all remaining fields ───────────────────────────────
+            _fill_all(page, profile, job, cover, username)
 
-            if not submitted:
-                # Try Lever-specific submit selector
-                sub = page.locator(
-                    "button[type=submit]:has-text('Submit'),"
-                    "button:has-text('Submit Application'),"
-                    "button[data-qa='submit-application']"
-                )
-                if sub.count() > 0:
-                    sub.first.click()
-                    _jitter(3, 5)
-                    submitted = True
+            # ── 5. Pre-submit audit ────────────────────────────────────────
+            _audit_form(page, username)
 
-            browser.close()
-            if submitted:
-                db.log(username, f"  ✓ Lever submitted: {job.get('title')}")
-                return {"success": True, "platform": "lever", "manual": False}
-            return _nope("lever", "Submit button not found", job)
+            # ── 6. Find and click Submit ───────────────────────────────────
+            sub_btn = None
+            for sub_sel in [
+                "button[data-qa='submit-application']",
+                "button[type=submit]:has-text('Submit')",
+                "button:has-text('Submit Application')",
+                "button:has-text('Submit my application')",
+                "button:has-text('Send Application')",
+                "button[type=submit]",
+            ]:
+                try:
+                    el = page.locator(sub_sel)
+                    if el.count() > 0 and el.first.is_visible():
+                        sub_btn = el.first
+                        L(f"Submit button: {el.first.text_content()[:30]}")
+                        break
+                except Exception: pass
+
+            if not sub_btn:
+                btns = []
+                try:
+                    for b in page.locator("button:visible").all()[:8]:
+                        btns.append(b.text_content()[:25])
+                except Exception: pass
+                L(f"No submit found. Buttons: {btns}")
+                browser.close()
+                return _nope("lever","Submit button not found",job)
+
+            sub_btn.click()
+            L("Clicked submit — waiting…")
+            _jitter(4, 6)
+
+            # ── 7. Scroll to top and check for errors ─────────────────────
+            try: page.evaluate("window.scrollTo(0,0)"); _jitter(1, 1.5)
+            except Exception: pass
+
+            errors = _get_errors(page)
+            if errors:
+                L(f"✗ VALIDATION ERRORS — not submitted:")
+                for e in errors: L(f"    → {e}")
+                # Retry once
+                _fill_all(page, profile, job, cover, username)
+                _jitter(1, 2)
+                try: sub_btn.click(); _jitter(4, 6)
+                except Exception: pass
+                errors2 = _get_errors(page)
+                if errors2:
+                    L(f"✗ Still {len(errors2)} errors after retry — marking manual")
+                    browser.close()
+                    return _nope("lever", f"Validation errors: {errors2[0][:80]}", job)
+
+            # ── 8. Confirm success ────────────────────────────────────────
+            post_url  = page.url
+            page_text = ""
+            try: page_text = page.inner_text("body")
+            except Exception: pass
+
+            success_phrases = ["thank you","thanks for applying","application received",
+                               "successfully submitted","we have received","you applied",
+                               "application complete","application submitted","check your email"]
+            url_keys        = ["thank","confirm","success","applied","complete","submitted"]
+
+            confirmed = (any(ph in page_text.lower() for ph in success_phrases)
+                         or any(k in post_url.lower() for k in url_keys))
+
+            L(f"Post-submit URL: {post_url[:80]}")
+            if confirmed:
+                L(f"✓ CONFIRMED submitted — confirmation phrase found")
+                browser.close()
+                return {"success":True,"platform":"lever","manual":False}
+            else:
+                L(f"~ Submit clicked but CANNOT CONFIRM success")
+                L(f"  Page snippet: {page_text[:200]}")
+                L(f"  Check your email for confirmation from Spotify/company")
+                browser.close()
+                # Return success=False so it's NOT marked submitted in DB
+                # until we actually confirm it
+                return {"success":False,"platform":"lever","manual":True,
+                        "reason":"Submitted but could not confirm — check your email and mark manually"}
 
         except Exception as e:
+            import traceback
+            L(f"Exception: {e}")
+            L(traceback.format_exc()[-400:])
             try: browser.close()
             except Exception: pass
             return _nope("lever", str(e)[:200], job)
