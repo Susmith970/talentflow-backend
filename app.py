@@ -723,6 +723,65 @@ def apply_from_url():
     })
 
 
+# ── LinkedIn Session ─────────────────────────────────────────────────────────
+
+@app.get("/api/linkedin/status")
+def linkedin_status():
+    """Check if LinkedIn session is saved and valid."""
+    u = require_auth()
+    import auto_apply as aa
+    has_session  = aa.SESSION_FILE.exists()
+    has_creds    = bool(os.environ.get("LINKEDIN_EMAIL") and os.environ.get("LINKEDIN_PASSWORD"))
+    session_age  = None
+    if has_session:
+        import time
+        age_secs   = time.time() - aa.SESSION_FILE.stat().st_mtime
+        session_age = f"{int(age_secs/3600)}h ago"
+    return jsonify({
+        "has_session":  has_session,
+        "has_creds":    has_creds,
+        "session_age":  session_age,
+        "ready":        has_session or has_creds,
+        "session_path": str(aa.SESSION_FILE),
+    })
+
+
+@app.post("/api/linkedin/save-session")
+def linkedin_save_session():
+    """
+    Upload LinkedIn session JSON (from browser export).
+    The session JSON can be exported using the EditThisCookie extension:
+    1. Log in to LinkedIn on your browser
+    2. Export cookies as JSON via EditThisCookie / Cookie Editor extension
+    3. POST that JSON here
+    """
+    u = require_auth()
+    import auto_apply as aa
+    body = request.json or {}
+    session_data = body.get("session_data") or body.get("cookies")
+    if not session_data:
+        return jsonify({"error": "session_data or cookies field required"}), 400
+    try:
+        # Validate it looks like a Playwright storage state or cookie array
+        if isinstance(session_data, list):
+            # Cookie array format — convert to Playwright storage state
+            storage = {
+                "cookies": session_data,
+                "origins": []
+            }
+        elif isinstance(session_data, dict):
+            storage = session_data
+        else:
+            return jsonify({"error": "session_data must be JSON object or array"}), 400
+
+        aa.SESSION_FILE.parent.mkdir(parents=True, exist_ok=True)
+        aa.SESSION_FILE.write_text(json.dumps(storage, indent=2))
+        db.log(u, f"LinkedIn session saved ({len(str(storage))} bytes)")
+        return jsonify({"ok": True, "message": "LinkedIn session saved — Easy Apply now active"})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 # ── Stripe / Subscriptions ───────────────────────────────────────────────────
 
 @app.post("/api/billing/create-checkout")
