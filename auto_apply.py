@@ -1581,9 +1581,16 @@ def _location_candidates(profile: dict) -> list:
     if state: candidates.append(state)
     # Full location string
     if location: candidates.append(location)
-    # City + state combo
+    # City + state combos
     if city and state_full: candidates.append(f"{city}, {state_full}")
     if city and state:      candidates.append(f"{city}, {state}")
+    # City, State, Country — "Sterling, Virginia, United States"
+    if city and state_full: candidates.append(f"{city}, {state_full}, United States")
+    if city and state:      candidates.append(f"{city}, {state}, United States")
+    if city and state_full: candidates.append(f"{city}, {state_full}, US")
+    # State, Country combos
+    if state_full: candidates.append(f"{state_full}, United States")
+    if state:      candidates.append(f"{state}, United States")
     # Country variants
     candidates.extend(country_variants)
     # Remove duplicates while preserving order
