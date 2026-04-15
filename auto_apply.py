@@ -1440,6 +1440,71 @@ def _greenhouse_playwright(job: dict, profile: dict, username: str,
             return _nope("greenhouse",str(e)[:200],job)
 
 
+def _location_candidates(profile: dict) -> list:
+    """
+    Return location values to try in priority order for a select dropdown.
+    Strategy: start most specific (city), then state, then country, then region.
+    This handles:
+      - Country dropdown:  "United States" → "United States of America" → "US" → "USA"
+      - State dropdown:    "Virginia" → "VA"
+      - City dropdown:     "Reston" → "Sterling" → "Northern Virginia"
+    """
+    city    = profile.get("address_city","").strip()          # "Reston"
+    state   = profile.get("address_state","").strip()         # "VA"
+    country = profile.get("address_country","United States").strip()
+    location = profile.get("location","").strip()             # "Reston, VA"
+
+    # State full name lookup
+    STATE_NAMES = {
+        "AL":"Alabama","AK":"Alaska","AZ":"Arizona","AR":"Arkansas","CA":"California",
+        "CO":"Colorado","CT":"Connecticut","DE":"Delaware","FL":"Florida","GA":"Georgia",
+        "HI":"Hawaii","ID":"Idaho","IL":"Illinois","IN":"Indiana","IA":"Iowa",
+        "KS":"Kansas","KY":"Kentucky","LA":"Louisiana","ME":"Maine","MD":"Maryland",
+        "MA":"Massachusetts","MI":"Michigan","MN":"Minnesota","MS":"Mississippi",
+        "MO":"Missouri","MT":"Montana","NE":"Nebraska","NV":"Nevada","NH":"New Hampshire",
+        "NJ":"New Jersey","NM":"New Mexico","NY":"New York","NC":"North Carolina",
+        "ND":"North Dakota","OH":"Ohio","OK":"Oklahoma","OR":"Oregon","PA":"Pennsylvania",
+        "RI":"Rhode Island","SC":"South Carolina","SD":"South Dakota","TN":"Tennessee",
+        "TX":"Texas","UT":"Utah","VT":"Vermont","VA":"Virginia","WA":"Washington",
+        "WV":"West Virginia","WI":"Wisconsin","WY":"Wyoming","DC":"District of Columbia",
+    }
+    state_full = STATE_NAMES.get(state.upper(), state)
+
+    # Country variants
+    country_variants = []
+    c = country.lower()
+    if "united states" in c or c in ("us","usa","u.s.","u.s.a.","america"):
+        country_variants = ["United States","United States of America","US","USA","U.S.","U.S.A."]
+    elif "united kingdom" in c or c in ("uk","gb","great britain"):
+        country_variants = ["United Kingdom","UK","GB","Great Britain"]
+    elif "canada" in c:
+        country_variants = ["Canada","CA"]
+    elif "india" in c:
+        country_variants = ["India","IN"]
+    else:
+        country_variants = [country]
+
+    candidates = []
+    # Most specific first: city
+    if city: candidates.append(city)
+    # State (full name then abbreviation)
+    if state_full and state_full != state: candidates.append(state_full)
+    if state: candidates.append(state)
+    # Full location string
+    if location: candidates.append(location)
+    # City + state combo
+    if city and state_full: candidates.append(f"{city}, {state_full}")
+    if city and state:      candidates.append(f"{city}, {state}")
+    # Country variants
+    candidates.extend(country_variants)
+    # Remove duplicates while preserving order
+    seen, result = set(), []
+    for c in candidates:
+        if c and c.lower() not in seen:
+            seen.add(c.lower()); result.append(c)
+    return result
+
+
 def _fill_all(page, profile: dict, job: dict, cover: str, username: str):
     """Fill every visible field: text, select, radio, checkbox."""
     def L(msg): db.log(username, f"  [FF] {msg}")
@@ -1482,8 +1547,18 @@ def _fill_all(page, profile: dict, job: dict, cover: str, username: str):
                 continue  # already has a value
             label    = _get_label(page, sel_el) or sel_el.get_attribute("name") or sel_el.get_attribute("id") or ""
             combined = label.lower()
-            val      = _answer(combined, profile)
-            if not val: continue
+
+            # For location-type fields, build a cascade of candidates
+            is_location_field = any(x in combined for x in (
+                "country","nation","state","province","city","location","region",
+                "where are you","where do you live","current location"))
+
+            if is_location_field:
+                candidates = _location_candidates(profile)
+            else:
+                val = _answer(combined, profile)
+                if not val: continue
+                candidates = [val]
 
             # Collect all non-empty options
             opts = sel_el.locator("option").all()
@@ -1496,30 +1571,43 @@ def _fill_all(page, profile: dict, job: dict, cover: str, username: str):
                 if ot.lower() not in skip_vals and ov.lower() not in skip_vals:
                     opt_pairs.append((ot, ov))
 
-            # Score-based matching — handles "United States +1", "No, I do not require..."
-            val_l = val.strip().lower()
             noise = {"a","the","i","in","do","of","or","at","any","time","future",
                      "require","sponsorship","may","currently","will","you","now"}
-            val_neg = "not" in val_l.split() or val_l.startswith("no ")
 
-            best_score, matched_label, matched_value = 0, None, None
-            for ot, ov in opt_pairs:
+            def _score_opt(val_str, ot, ov):
+                """Score how well val_str matches option (ot=label, ov=value).
+                Uses whole-word matching for score=70 to avoid 'Virginia' matching 'India'.
+                ('india' is a substring of 'virginia' — false positive without word boundary)
+                """
+                import re as _re
+                def _word_in(needle, haystack):
+                    return bool(_re.search(r'\b' + _re.escape(needle.strip()) + r'\b', haystack, _re.I))
+                vl = val_str.strip().lower()
                 ot_l = ot.lower(); ov_l = ov.lower()
+                val_neg = "not" in vl.split() or vl.startswith("no ")
                 opt_neg = "not" in ot_l.split() or ot_l.startswith("no ")
                 neg_pen = 40 if (val_neg != opt_neg) else 0
                 score = 0
-                if val_l == ot_l or val_l == ov_l:                      score = 100
-                elif ot_l.startswith(val_l) or ov_l.startswith(val_l):  score = 90
-                elif val_l in ot_l or val_l in ov_l:                    score = 80
-                elif ot_l in val_l or ov_l in val_l:                    score = 70
+                if vl == ot_l or vl == ov_l:                       score = 100
+                elif ot_l.startswith(vl) or ov_l.startswith(vl):   score = 90
+                elif vl in ot_l or vl in ov_l:                     score = 80
+                elif _word_in(ot_l, vl) or _word_in(ov_l, vl):     score = 70  # whole-word only
                 else:
-                    vw = set(val_l.split()) - noise
+                    vw = set(vl.split()) - noise
                     ow = set(ot_l.split()) - noise
                     if vw and ow:
                         score = int(len(vw & ow) / len(vw) * 60)
-                score = max(0, score - neg_pen)
-                if score > best_score:
-                    best_score, matched_label, matched_value = score, ot, ov
+                return max(0, score - neg_pen)
+
+            # Try each candidate in priority order — first hit wins
+            best_score, matched_label, matched_value = 0, None, None
+            for candidate in candidates:
+                for ot, ov in opt_pairs:
+                    s = _score_opt(candidate, ot, ov)
+                    if s > best_score:
+                        best_score, matched_label, matched_value = s, ot, ov
+                if best_score >= 70:
+                    break  # good enough match found — stop trying more candidates
 
             if matched_label or matched_value:
                 try:
