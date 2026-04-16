@@ -1736,99 +1736,131 @@ def _greenhouse_playwright(job: dict, profile: dict, username: str,
             return _nope("greenhouse",str(e)[:200],job)
 
 
-def _location_candidates(profile: dict) -> list:
-    """
-    Return location values to try in priority order for a select dropdown.
-    Strategy: start most specific (city), then state, then country, then region.
-    This handles:
-      - Country dropdown:  "United States" → "United States of America" → "US" → "USA"
-      - State dropdown:    "Virginia" → "VA"
-      - City dropdown:     "Reston" → "Sterling" → "Northern Virginia"
-    """
-    city    = profile.get("address_city","").strip()          # "Reston"
-    state   = profile.get("address_state","").strip()         # "VA"
-    country = profile.get("address_country","United States").strip()
-    location = profile.get("location","").strip()             # "Reston, VA"
+# ── State name lookup (module-level so it can be used by multiple functions) ──
+_STATE_NAMES = {
+    "AL":"Alabama","AK":"Alaska","AZ":"Arizona","AR":"Arkansas","CA":"California",
+    "CO":"Colorado","CT":"Connecticut","DE":"Delaware","FL":"Florida","GA":"Georgia",
+    "HI":"Hawaii","ID":"Idaho","IL":"Illinois","IN":"Indiana","IA":"Iowa",
+    "KS":"Kansas","KY":"Kentucky","LA":"Louisiana","ME":"Maine","MD":"Maryland",
+    "MA":"Massachusetts","MI":"Michigan","MN":"Minnesota","MS":"Mississippi",
+    "MO":"Missouri","MT":"Montana","NE":"Nebraska","NV":"Nevada","NH":"New Hampshire",
+    "NJ":"New Jersey","NM":"New Mexico","NY":"New York","NC":"North Carolina",
+    "ND":"North Dakota","OH":"Ohio","OK":"Oklahoma","OR":"Oregon","PA":"Pennsylvania",
+    "RI":"Rhode Island","SC":"South Carolina","SD":"South Dakota","TN":"Tennessee",
+    "TX":"Texas","UT":"Utah","VT":"Vermont","VA":"Virginia","WA":"Washington",
+    "WV":"West Virginia","WI":"Wisconsin","WY":"Wyoming","DC":"District of Columbia",
+}
 
-    # State full name lookup
-    STATE_NAMES = {
-        "AL":"Alabama","AK":"Alaska","AZ":"Arizona","AR":"Arkansas","CA":"California",
-        "CO":"Colorado","CT":"Connecticut","DE":"Delaware","FL":"Florida","GA":"Georgia",
-        "HI":"Hawaii","ID":"Idaho","IL":"Illinois","IN":"Indiana","IA":"Iowa",
-        "KS":"Kansas","KY":"Kentucky","LA":"Louisiana","ME":"Maine","MD":"Maryland",
-        "MA":"Massachusetts","MI":"Michigan","MN":"Minnesota","MS":"Mississippi",
-        "MO":"Missouri","MT":"Montana","NE":"Nebraska","NV":"Nevada","NH":"New Hampshire",
-        "NJ":"New Jersey","NM":"New Mexico","NY":"New York","NC":"North Carolina",
-        "ND":"North Dakota","OH":"Ohio","OK":"Oklahoma","OR":"Oregon","PA":"Pennsylvania",
-        "RI":"Rhode Island","SC":"South Carolina","SD":"South Dakota","TN":"Tennessee",
-        "TX":"Texas","UT":"Utah","VT":"Vermont","VA":"Virginia","WA":"Washington",
-        "WV":"West Virginia","WI":"Wisconsin","WY":"Wyoming","DC":"District of Columbia",
-    }
-    state_full = STATE_NAMES.get(state.upper(), state)
+
+def _location_candidates(profile: dict, field_hint: str = "") -> list:
+    """
+    Return location values to try in priority order.
+    field_hint: 'country', 'state', 'city', or '' for generic/combined.
+
+    Priority order per your spec:
+      1. Sterling, Virginia, United States  (full combined)
+      2. Sterling, Virginia, USA / US / United States of America
+      3. Sterling, VA, United States
+      4. Sterling, VA, USA / US
+      5. Sterling, Virginia  (city + state, no country)
+      6. Sterling, VA
+      7. Virginia / Virginia, United States  (state only — for state dropdowns)
+      8. VA  (abbreviation — only if state field specifically)
+      9. United States / United States of America / USA / US  (country only)
+     10. Sterling  (city only — for city-only dropdowns)
+    """
+    city     = profile.get("address_city","").strip()
+    state    = profile.get("address_state","").strip()
+    country  = profile.get("address_country","United States").strip()
+    location = profile.get("location","").strip()
+
+    state_full = _STATE_NAMES.get(state.upper(), state)
 
     # Country variants
-    country_variants = []
     c = country.lower()
     if "united states" in c or c in ("us","usa","u.s.","u.s.a.","america"):
-        country_variants = ["United States","United States of America","US","USA","U.S.","U.S.A."]
+        cv = ["United States","United States of America","USA","US","U.S.A.","U.S."]
     elif "united kingdom" in c or c in ("uk","gb","great britain"):
-        country_variants = ["United Kingdom","UK","GB","Great Britain"]
+        cv = ["United Kingdom","UK","GB","Great Britain"]
     elif "canada" in c:
-        country_variants = ["Canada","CA"]
+        cv = ["Canada","CA"]
     elif "india" in c:
-        country_variants = ["India","IN"]
+        cv = ["India","IN"]
     else:
-        country_variants = [country]
+        cv = [country]
 
+    hint = field_hint.lower()
+
+    # ── Country-only dropdown ────────────────────────────────────────────────
+    if "country" in hint or "nation" in hint:
+        return cv
+
+    # ── State-only dropdown ─────────────────────────────────────────────────
+    if "state" in hint or "province" in hint or "region" in hint:
+        out = []
+        if state_full and state_full != state:
+            out += [state_full, f"{state_full}, United States", f"{state_full}, USA"]
+        if state:
+            out += [state, f"{state}, United States", f"{state}, USA"]
+        return _dedup(out)
+
+    # ── City-only dropdown ──────────────────────────────────────────────────
+    if hint in ("city","town","municipality"):
+        return _dedup([city, location.split(",")[0].strip() if "," in location else ""])
+
+    # ── Generic / combined — try most-specific first ─────────────────────────
     candidates = []
 
-    # ── FULL FORMATS FIRST (most specific — what most forms expect) ───────────
-    # "Sterling, Virginia, United States of America"
-    # "Sterling, Virginia, United States"
-    # "Sterling, Virginia, USA"
-    # "Sterling, VA, United States"
-    # "Sterling, VA, USA"
+    # Full: city + state_full + country variants
     if city and state_full and state_full != state:
-        candidates.append(f"{city}, {state_full}, United States of America")
-        candidates.append(f"{city}, {state_full}, United States")
-        candidates.append(f"{city}, {state_full}, USA")
-        candidates.append(f"{city}, {state_full}, US")
-    if city and state:
-        candidates.append(f"{city}, {state}, United States")
-        candidates.append(f"{city}, {state}, USA")
-        candidates.append(f"{city}, {state}, US")
+        for c_var in cv[:3]:
+            candidates.append(f"{city}, {state_full}, {c_var}")
 
-    # ── CITY + STATE (no country) ─────────────────────────────────────────────
-    # "Sterling, Virginia"
-    # "Sterling, VA"
+    # Full: city + state abbrev + country
+    if city and state:
+        for c_var in cv[:3]:
+            candidates.append(f"{city}, {state}, {c_var}")
+
+    # City + state_full (no country)
     if city and state_full and state_full != state:
         candidates.append(f"{city}, {state_full}")
+
+    # City + state abbrev (no country)
     if city and state:
         candidates.append(f"{city}, {state}")
 
-    # ── PROFILE LOCATION STRING ───────────────────────────────────────────────
+    # Profile location string
     if location and location not in candidates:
         candidates.append(location)
 
-    # ── CITY ONLY (city dropdown) ─────────────────────────────────────────────
+    # State full + country
+    if state_full and state_full != state:
+        for c_var in cv[:2]:
+            candidates.append(f"{state_full}, {c_var}")
+        candidates.append(state_full)
+
+    # State abbrev (only as fallback — "VA" can match "Vatican City")
+    # Added after state_full to give full name priority
+    if state and state != state_full:
+        candidates.append(f"{state}, United States")
+
+    # Country only
+    candidates.extend(cv)
+
+    # City only (last resort for city-only dropdowns detected as generic)
     if city:
         candidates.append(city)
 
-    # ── STATE LEVEL ───────────────────────────────────────────────────────────
-    if state_full and state_full != state:
-        candidates.append(f"{state_full}, United States")
-        candidates.append(state_full)
-    # NOTE: Do NOT add bare state abbreviation — "VA" matches Vatican City ISO code
+    return _dedup(candidates)
 
-    # ── COUNTRY LEVEL (last resort for country-only dropdowns) ────────────────
-    candidates.extend(country_variants)
 
-    # Remove duplicates while preserving order
-    seen, result = set(), []
-    for c in candidates:
-        if c and c.lower() not in seen:
-            seen.add(c.lower()); result.append(c)
-    return result
+def _dedup(lst: list) -> list:
+    """Remove duplicates preserving order, skip empty strings."""
+    seen, out = set(), []
+    for v in lst:
+        if v and v.lower() not in seen:
+            seen.add(v.lower()); out.append(v)
+    return out
 
 
 def _fill_all(page, profile: dict, job: dict, cover: str, username: str):
@@ -1888,17 +1920,49 @@ def _fill_all(page, profile: dict, job: dict, cover: str, username: str):
                     inp.dispatch_event("input")
                     inp.dispatch_event("change")
                     _jitter(0.1, 0.2)
-                    # If it's a location/city autocomplete, try pressing Enter or Tab
-                    if any(x in combined for x in ("location","city","where")):
-                        inp.press("Tab")
-                        _jitter(0.3, 0.5)
+                    # Location/city autocomplete — wait for suggestions then pick first
+                    if any(x in combined for x in ("location","city","where","state","country")):
+                        _jitter(0.6, 1.0)
+                        try:
+                            inp.press("ArrowDown")
+                            _jitter(0.3, 0.5)
+                            dropdown = page.locator(
+                                "[role=listbox]:visible,[role=option]:visible,"
+                                ".pac-item:visible,.autocomplete-item:visible"
+                            )
+                            if dropdown.count() > 0:
+                                dropdown.first.click()
+                                _jitter(0.4, 0.6)
+                            else:
+                                inp.press("Tab")
+                                _jitter(0.3, 0.5)
+                        except Exception:
+                            try: inp.press("Tab"); _jitter(0.3, 0.5)
+                            except Exception: pass
                 except Exception: pass
                 filled.append(f"{label[:20] or attrs[:20]}={str(val)[:15]}")
                 _jitter(0.05, 0.1)
         except Exception: pass
 
-    # ── Select dropdowns ─────────────────────────────────────────────────────
-    for sel_el in page.locator("select:visible").all():
+    # ── Select dropdowns — country first, then state, then city ─────────────
+    # Sort so country dropdowns fill before state (which may only appear after country selected)
+    def _sel_sort_key(sel_el):
+        try:
+            lbl = (_get_label(page, sel_el) or
+                   sel_el.get_attribute("name") or
+                   sel_el.get_attribute("id") or "").lower()
+            if "country" in lbl or "nation" in lbl: return 0
+            if "state"   in lbl or "province" in lbl: return 1
+            if "city"    in lbl or "town" in lbl:     return 2
+        except Exception: pass
+        return 3
+
+    try:
+        all_selects = sorted(page.locator("select:visible").all(), key=_sel_sort_key)
+    except Exception:
+        all_selects = page.locator("select:visible").all()
+
+    for sel_el in all_selects:
         try:
             if not sel_el.is_visible() or sel_el.is_disabled(): continue
             curr_val = (sel_el.input_value() or "").strip()
@@ -1907,13 +1971,23 @@ def _fill_all(page, profile: dict, job: dict, cover: str, username: str):
             label    = _get_label(page, sel_el) or sel_el.get_attribute("name") or sel_el.get_attribute("id") or ""
             combined = label.lower()
 
+            # Determine field hint for precise location matching
+            if "country" in combined or "nation" in combined:
+                field_hint = "country"
+            elif any(x in combined for x in ("state","province","region")):
+                field_hint = "state"
+            elif any(x in combined for x in ("city","town","municipality")):
+                field_hint = "city"
+            else:
+                field_hint = ""
+
             # For location-type fields, build a cascade of candidates
             is_location_field = any(x in combined for x in (
                 "country","nation","state","province","city","location","region",
                 "where are you","where do you live","current location"))
 
             if is_location_field:
-                candidates = _location_candidates(profile)
+                candidates = _location_candidates(profile, field_hint)
             else:
                 val = _answer(combined, profile)
                 if not val: continue
@@ -2067,7 +2141,13 @@ def _fill_all(page, profile: dict, job: dict, cover: str, username: str):
                         """, {"el": sel_el.element_handle(), "val": target_value, "lbl": target_label})
                     except Exception: pass
 
-                    _jitter(0.4, 0.7)  # give React time to re-render after events
+                    # Country dropdown → wait longer for state options to load
+                    if is_location_field and field_hint == "country":
+                        _jitter(1.5, 2.5)
+                    elif is_location_field:
+                        _jitter(0.6, 1.0)
+                    else:
+                        _jitter(0.4, 0.7)  # give React time to re-render after events
 
                     # Verify it stuck
                     new_val = (sel_el.input_value() or "").strip()
