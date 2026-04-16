@@ -167,7 +167,7 @@ def _answer(question: str, profile: dict) -> str:
     if any(x in q for x in ("street address","address line 1","address1","street")):
         return profile.get("address_line1","") or profile.get("location","")
     # Word boundary check — "city" must not match inside "ethnicity"
-    if re.search(r'\bcity\b|\btown\b|\bmunicipality\b', q):
+    if re.search(r'\bcity\b|\btown\b|\bmunicipality\b', q) and 'ethnic' not in q and 'race' not in q:
         city = profile.get("address_city","")
         if not city:
             loc = profile.get("location","")
@@ -338,7 +338,7 @@ def _answer(question: str, profile: dict) -> str:
     if any(x in q for x in ("disability","disabled","accommodation",
                               "what is your disability","disability status","disability or impairment")):
         return profile.get("disability_status","I do not have a disability")
-    if re.search(r"gender|sex", q):
+    if any(x in q for x in ("gender","gender identity","sex","sexual")):
         return profile.get("gender","Male")
     if any(x in q for x in ("race","ethnicity","hispanic","latino","ancestry")):
         return profile.get("race_ethnicity","Asian")
@@ -387,7 +387,11 @@ def _answer(question: str, profile: dict) -> str:
                     "18 years","18 or older","us person","willing","able to",
                     "available","authorized","eligible",
                     "adheres to","please review","i have read","certify","attest",
-                    "robinhood adheres","please review and acknowledge"]
+                    "robinhood adheres","please review and acknowledge",
+                    "currently located","currently located in t","currently located in u",
+                    "currently in the us","based in the us","reside in the us",
+                    "living in the us","present in the us","located in the us",
+                    "located in us","in the us or","are you in the us"]
     if any(x in q for x in yes_patterns):
         return "Yes"
 
@@ -491,10 +495,19 @@ def _select(label: str, options: list, profile: dict) -> str:
         return ""
     ol = [o.lower() for o in opts]
 
+    PLACEHOLDERS = {"","--","select","choose","please select","- select -",
+                    "n/a","none","select one","pick one","select an option",
+                    "please choose","select a value","not specified","select..."}
+
+    def non_placeholder_opts():
+        return [o for o in opts if o.strip().lower() not in PLACEHOLDERS]
+
     def first(*kws):
         for kw in kws:
             for i, o in enumerate(ol):
+                if o.strip().lower() in PLACEHOLDERS: continue
                 if kw in o: return opts[i]
+        return None
         return None
 
     def match_answer(answer: str):
@@ -516,115 +529,115 @@ def _select(label: str, options: list, profile: dict) -> str:
     # Work authorization
     if any(x in lab for x in ("authorized","eligible","right to work","work authorization")):
         auth = profile.get("work_authorized","Yes")
-        if auth == "Yes": return first("yes","authorized","citizen","permanent") or opts[0]
-        return first("no","not authorized") or opts[-1]
+        if auth == "Yes": return first("yes","authorized","citizen","permanent") or (non_placeholder_opts()[0] if non_placeholder_opts() else None)
+        return first("no","not authorized") or (non_placeholder_opts()[-1] if non_placeholder_opts() else None)
 
     # Sponsorship
     if any(x in lab for x in ("sponsor","sponsorship","visa")):
         if profile.get("requires_sponsorship","No") == "No":
-            return first("no","will not","do not") or opts[0]
-        return first("yes","will require") or opts[-1]
+            return first("no","will not","do not") or (non_placeholder_opts()[0] if non_placeholder_opts() else None)
+        return first("yes","will require") or (non_placeholder_opts()[-1] if non_placeholder_opts() else None)
 
     # Citizenship
     if "citizen" in lab or "immigration" in lab:
         cs = profile.get("citizenship_status","U.S. Citizen")
-        return match_answer(cs) or first("citizen","us citizen","permanent") or opts[0]
+        return match_answer(cs) or first("citizen","us citizen","permanent") or (non_placeholder_opts()[0] if non_placeholder_opts() else None)
 
     # Experience level / seniority
     if any(x in lab for x in ("experience level","seniority","level","career level","grade")):
         yrs = int(profile.get("years_experience",3) or 3)
-        if yrs >= 10: return first("staff","principal","director","vp","10","executive") or opts[-1]
-        if yrs >= 7:  return first("staff","senior","lead","sr","7","8","9") or opts[0]
-        if yrs >= 4:  return first("senior","mid","sr","iii","4","5","6") or opts[0]
-        if yrs >= 2:  return first("mid","associate","ii","2","3") or opts[0]
-        return first("junior","entry","associate","i","0","1") or opts[0]
+        if yrs >= 10: return first("staff","principal","director","vp","10","executive") or (non_placeholder_opts()[-1] if non_placeholder_opts() else None)
+        if yrs >= 7:  return first("staff","senior","lead","sr","7","8","9") or (non_placeholder_opts()[0] if non_placeholder_opts() else None)
+        if yrs >= 4:  return first("senior","mid","sr","iii","4","5","6") or (non_placeholder_opts()[0] if non_placeholder_opts() else None)
+        if yrs >= 2:  return first("mid","associate","ii","2","3") or (non_placeholder_opts()[0] if non_placeholder_opts() else None)
+        return first("junior","entry","associate","i","0","1") or (non_placeholder_opts()[0] if non_placeholder_opts() else None)
 
     # Employment type
     if any(x in lab for x in ("employment type","job type","work type","position type")):
         et = (profile.get("employment_type","Full-time") or "Full-time").lower()
-        if "contract" in et: return first("contract","contractor","1099") or opts[0]
-        if "part" in et:     return first("part-time","part time") or opts[0]
-        return first("full-time","full time","permanent","regular") or opts[0]
+        if "contract" in et: return first("contract","contractor","1099") or (non_placeholder_opts()[0] if non_placeholder_opts() else None)
+        if "part" in et:     return first("part-time","part time") or (non_placeholder_opts()[0] if non_placeholder_opts() else None)
+        return first("full-time","full time","permanent","regular") or (non_placeholder_opts()[0] if non_placeholder_opts() else None)
 
     # Education / degree
     if any(x in lab for x in ("education","degree","highest","qualification","academic")):
         deg = (profile.get("highest_degree","Master's Degree") or "").lower()
-        if "phd" in deg or "doctor" in deg: return first("phd","doctorate","doctoral") or opts[0]
-        if "master" in deg: return first("master","ms ","m.s","mba","graduate") or opts[0]
-        if "bachelor" in deg: return first("bachelor","bs ","b.s","ba ","b.a","undergrad") or opts[0]
-        return first("bachelor","undergraduate","some college") or opts[0]
+        if "phd" in deg or "doctor" in deg: return first("phd","doctorate","doctoral") or (non_placeholder_opts()[0] if non_placeholder_opts() else None)
+        if "master" in deg: return first("master","ms ","m.s","mba","graduate") or (non_placeholder_opts()[0] if non_placeholder_opts() else None)
+        if "bachelor" in deg: return first("bachelor","bs ","b.s","ba ","b.a","undergrad") or (non_placeholder_opts()[0] if non_placeholder_opts() else None)
+        return first("bachelor","undergraduate","some college") or (non_placeholder_opts()[0] if non_placeholder_opts() else None)
 
     # Salary / compensation
     if any(x in lab for x in ("salary","compensation","pay range","hourly rate")):
         sal = profile.get("salary_expectation","")
-        if sal: return match_answer(str(sal)) or opts[0]
+        if sal: return match_answer(str(sal)) or (non_placeholder_opts()[0] if non_placeholder_opts() else None)
         return opts[0]
 
     # Relocation
     if "relocat" in lab:
         rel = profile.get("willing_to_relocate","Yes")
-        if rel == "Yes": return first("yes","willing","open to") or opts[0]
-        return first("no","not willing","unable") or opts[-1]
+        if rel == "Yes": return first("yes","willing","open to") or (non_placeholder_opts()[0] if non_placeholder_opts() else None)
+        return first("no","not willing","unable") or (non_placeholder_opts()[-1] if non_placeholder_opts() else None)
 
     # Remote / work arrangement
     if any(x in lab for x in ("remote","work arrangement","hybrid","work location","office")):
         pref = (profile.get("remote_preference","Open to both") or "").lower()
-        if "remote" in pref: return first("remote","fully remote","100% remote") or opts[0]
-        if "office" in pref or "on-site" in pref: return first("onsite","on-site","office") or opts[0]
-        return first("hybrid","flexible","open","remote") or opts[0]
+        if "remote" in pref: return first("remote","fully remote","100% remote") or (non_placeholder_opts()[0] if non_placeholder_opts() else None)
+        if "office" in pref or "on-site" in pref: return first("onsite","on-site","office") or (non_placeholder_opts()[0] if non_placeholder_opts() else None)
+        return first("hybrid","flexible","open","remote") or (non_placeholder_opts()[0] if non_placeholder_opts() else None)
 
     # Veteran
     if "veteran" in lab or "military" in lab:
         vs = (profile.get("veteran_status","I am not a veteran") or "").lower()
-        if "not" in vs: return first("not","no","i am not","non-veteran","0") or opts[0]
-        if "disabled" in vs: return first("disabled veteran","service-connected") or opts[0]
-        return first("veteran","yes","protected") or opts[0]
+        if "not" in vs: return first("not","no","i am not","non-veteran","0") or (non_placeholder_opts()[0] if non_placeholder_opts() else None)
+        if "disabled" in vs: return first("disabled veteran","service-connected") or (non_placeholder_opts()[0] if non_placeholder_opts() else None)
+        return first("veteran","yes","protected") or (non_placeholder_opts()[0] if non_placeholder_opts() else None)
 
     # Disability
     if "disab" in lab:
         ds = (profile.get("disability_status","I do not have a disability") or "").lower()
-        if "not" in ds or "no" in ds: return first("no","not","i don","do not","0") or opts[0]
-        return first("yes","i have","1") or opts[0]
+        if "not" in ds or "no" in ds: return first("no","not","i don","do not","0") or (non_placeholder_opts()[0] if non_placeholder_opts() else None)
+        return first("yes","i have","1") or (non_placeholder_opts()[0] if non_placeholder_opts() else None)
 
     # Gender
     if re.search(r"gender|sex(?:$| )", lab):
         gd = (profile.get("gender","Prefer not to say") or "").lower()
-        if gd == "male": return first("male","man") or opts[0]
-        if gd == "female": return first("female","woman") or opts[0]
-        return first("prefer not","decline","other","non-binary") or opts[0]
+        if gd == "male": return first("male","man") or (non_placeholder_opts()[0] if non_placeholder_opts() else None)
+        if gd == "female": return first("female","woman") or (non_placeholder_opts()[0] if non_placeholder_opts() else None)
+        return first("prefer not","decline","other","non-binary") or (non_placeholder_opts()[0] if non_placeholder_opts() else None)
 
     # Race / ethnicity
     if any(x in lab for x in ("race","ethnic","hispanic","origin")):
         re_val = (profile.get("race_ethnicity","Prefer not to say") or "").lower()
-        return match_answer(re_val) or first("prefer not","decline","not specified") or opts[0]
+        return match_answer(re_val) or first("prefer not","decline","not specified") or (non_placeholder_opts()[0] if non_placeholder_opts() else None)
 
     # Background check / drug test
     if "background" in lab or "drug" in lab:
-        return first("yes","agree","consent","i consent") or opts[0]
+        return first("yes","agree","consent","i consent") or (non_placeholder_opts()[0] if non_placeholder_opts() else None)
 
     # Referral
     if any(x in lab for x in ("source","hear","referral","how did")):
         ref = profile.get("referral_source","LinkedIn")
-        return match_answer(ref) or first("linkedin","internet","website","online") or opts[0]
+        return match_answer(ref) or first("linkedin","internet","website","online") or (non_placeholder_opts()[0] if non_placeholder_opts() else None)
 
     # Start / availability
     if any(x in lab for x in ("start","available","notice")):
         sd = (profile.get("start_date","2 weeks") or "").lower()
-        if "immediately" in sd or "now" in sd: return first("immediately","now","asap") or opts[0]
-        if "2 week" in sd or "two week" in sd: return first("2 week","two week") or opts[0]
-        if "1 month" in sd or "30" in sd: return first("1 month","30 day","four week") or opts[0]
-        return first("2 week","two week","flexible") or opts[0]
+        if "immediately" in sd or "now" in sd: return first("immediately","now","asap") or (non_placeholder_opts()[0] if non_placeholder_opts() else None)
+        if "2 week" in sd or "two week" in sd: return first("2 week","two week") or (non_placeholder_opts()[0] if non_placeholder_opts() else None)
+        if "1 month" in sd or "30" in sd: return first("1 month","30 day","four week") or (non_placeholder_opts()[0] if non_placeholder_opts() else None)
+        return first("2 week","two week","flexible") or (non_placeholder_opts()[0] if non_placeholder_opts() else None)
 
     # Yes/No generic
     yes_labels = ["agree","consent","acknowledge","authorized","eligible","willing",
                    "available","able","confirm","18","us person","authorized to"]
     if any(x in lab for x in yes_labels):
-        return first("yes","i agree","i consent","agree","true") or opts[0]
+        return first("yes","i agree","i consent","agree","true") or (non_placeholder_opts()[0] if non_placeholder_opts() else None)
 
     # Fallback: try to match using _answer
     answer = _answer(label, profile)
     if answer:
-        return match_answer(answer) or opts[0]
+        return match_answer(answer) or (non_placeholder_opts()[0] if non_placeholder_opts() else None)
 
     return opts[0]
 
