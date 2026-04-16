@@ -188,6 +188,12 @@ def _answer(question: str, profile: dict) -> str:
         if c.lower() in ("united states","us","usa","u.s.","u.s.a."):
             return "United States"  # matches both "United States" and "United States of America"
         return c
+    # Preferred office location MUST come before generic "location" match
+    if any(x in q for x in ("preferred office location","preferred office","which office",
+                              "office location preference","office you would like",
+                              "office you prefer","what office","preferred work location")):
+        return "__PICK_ANY__"  # select loop picks first available city option
+
     if any(x in q for x in ("location","where are you located","city, state",
                               "current location","what is your location",
                               "where are you based","where do you live",
@@ -347,6 +353,11 @@ def _answer(question: str, profile: dict) -> str:
         return "No"
     if any(x in q for x in ("have you used","do you use our","are you a customer of",
                               "have you ever used our")):
+        return "Yes"
+
+    if any(x in q for x in ("willing to work from","work from the office",
+                              "work from our office","willing to commute",
+                              "work on site","work onsite","in-person work")):
         return "Yes"
 
     # ── Generic yes/no defaults ───────────────────────────────────────────────
@@ -1752,27 +1763,47 @@ def _fill_all(page, profile: dict, job: dict, cover: str, username: str):
                 if best_score >= 70:
                     break  # good enough match found — stop trying more candidates
 
-            # If no match found OR low-confidence match → ask Claude for required fields
+            # Handle __PICK_ANY__ marker — just use first available option
+            pick_any = any(c == "__PICK_ANY__" for c in candidates)
+            if pick_any and opt_pairs:
+                matched_label, matched_value = opt_pairs[0]
+                best_score = 99
+                L(f"  PickAny '{label[:25]}' = '{matched_label[:20]}'")
+
+            # If no match found OR low-confidence match → try Claude then first option
             html_req_sel = sel_el.get_attribute("required") is not None
             aria_req_sel = sel_el.get_attribute("aria-required") == "true"
-            if (not matched_label and not matched_value) or (best_score < 50 and (html_req_sel or aria_req_sel)):
-                try:
-                    html_req = html_req_sel
-                    aria_req = aria_req_sel
-                    if (html_req or aria_req) and opt_pairs:
+            css_req_sel  = False
+            try:
+                css_req_sel = bool(page.evaluate(
+                    "el => { let p=el.parentElement; for(let i=0;i<3;i++){ if(!p)break;"
+                    "if(p.classList.contains('required'))return true; p=p.parentElement;}"
+                    "return false; }", sel_el.element_handle()))
+            except Exception: pass
+            is_req = html_req_sel or aria_req_sel or css_req_sel
+
+            if (not matched_label and not matched_value) or (best_score < 50 and is_req):
+                # Try Claude first
+                if is_req and opt_pairs:
+                    try:
                         opt_labels = [ot for ot,_ in opt_pairs]
                         claude_pick = _claude_answer(
-                            f"{label} (choose one: {', '.join(opt_labels[:8])})",
+                            f"{label} (choose one: {', '.join(opt_labels[:10])})",
                             "select", profile, job)
                         if claude_pick:
-                            # Find the best matching option for Claude's answer
                             for ot, ov in opt_pairs:
                                 s = _score_opt(claude_pick, ot, ov)
                                 if s > best_score:
                                     best_score, matched_label, matched_value = s, ot, ov
                             if matched_label:
                                 L(f"Claude picked '{label[:25]}' = '{matched_label[:25]}'")
-                except Exception: pass
+                    except Exception: pass
+
+                # Final fallback: required field with no match → pick first option
+                if (not matched_label and not matched_value) and is_req and opt_pairs:
+                    matched_label, matched_value = opt_pairs[0]
+                    best_score = 1
+                    L(f"  Fallback first option '{label[:25]}' = '{matched_label[:20]}'")
 
             if matched_label or matched_value:
                 try:
