@@ -30,11 +30,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 import db
 
-ROOT         = Path(__file__).parent.parent
-DATA_DIR     = ROOT / "data"
+# Use same DATA_DIR as db.py — consistent across app.py, db.py, auto_apply.py
+DATA_DIR     = db.DATA_DIR
 SESSION_FILE = DATA_DIR / "linkedin_session.json"
 
-DATA_DIR.mkdir(exist_ok=True)
+DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 
 # ── Utilities ─────────────────────────────────────────────────────────────────
