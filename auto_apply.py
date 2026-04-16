@@ -198,12 +198,34 @@ def _answer(question: str, profile: dict) -> str:
                               "current location","what is your location",
                               "where are you based","where do you live",
                               "city and state","city/state")):
-        loc = profile.get("location","")
-        if not loc:
-            city  = profile.get("address_city","")
-            state = profile.get("address_state","")
-            loc   = f"{city}, {state}".strip(", ") if city or state else ""
-        return loc
+        city    = profile.get("address_city","").strip()
+        state   = profile.get("address_state","").strip()
+        country = profile.get("address_country","United States").strip()
+        location= profile.get("location","").strip()
+        # Build the fullest format: "Sterling, Virginia, United States"
+        STATE_NAMES = {
+            "AL":"Alabama","AK":"Alaska","AZ":"Arizona","AR":"Arkansas","CA":"California",
+            "CO":"Colorado","CT":"Connecticut","DE":"Delaware","FL":"Florida","GA":"Georgia",
+            "HI":"Hawaii","ID":"Idaho","IL":"Illinois","IN":"Indiana","IA":"Iowa",
+            "KS":"Kansas","KY":"Kentucky","LA":"Louisiana","ME":"Maine","MD":"Maryland",
+            "MA":"Massachusetts","MI":"Michigan","MN":"Minnesota","MS":"Mississippi",
+            "MO":"Missouri","MT":"Montana","NE":"Nebraska","NV":"Nevada","NH":"New Hampshire",
+            "NJ":"New Jersey","NM":"New Mexico","NY":"New York","NC":"North Carolina",
+            "ND":"North Dakota","OH":"Ohio","OK":"Oklahoma","OR":"Oregon","PA":"Pennsylvania",
+            "RI":"Rhode Island","SC":"South Carolina","SD":"South Dakota","TN":"Tennessee",
+            "TX":"Texas","UT":"Utah","VT":"Vermont","VA":"Virginia","WA":"Washington",
+            "WV":"West Virginia","WI":"Wisconsin","WY":"Wyoming","DC":"District of Columbia",
+        }
+        state_full = STATE_NAMES.get(state.upper(), state)
+        if city and state_full:
+            return f"{city}, {state_full}, {country}"
+        elif city and state:
+            return f"{city}, {state}, {country}"
+        elif location:
+            return location
+        elif city:
+            return city
+        return ""
 
     # ── Professional links ────────────────────────────────────────────────────
     if "linkedin" in q:
@@ -1620,26 +1642,48 @@ def _location_candidates(profile: dict) -> list:
         country_variants = [country]
 
     candidates = []
-    # 1. City only (matches city dropdowns)
-    if city: candidates.append(city)
-    # 2. State full name (matches state dropdowns)
-    if state_full and state_full != state: candidates.append(state_full)
-    # 3. State abbreviation
-    if state: candidates.append(state)
-    # 4. "City, State, Country" — e.g. "Sterling, Virginia, United States"
-    if city and state_full: candidates.append(f"{city}, {state_full}, United States")
-    if city and state_full: candidates.append(f"{city}, {state_full}, US")
-    if city and state:      candidates.append(f"{city}, {state}, United States")
-    # 5. "City, State" — e.g. "Reston, VA" or "Reston, Virginia"
-    if city and state_full: candidates.append(f"{city}, {state_full}")
-    if city and state:      candidates.append(f"{city}, {state}")
-    # 6. Full location string from profile
-    if location: candidates.append(location)
-    # 7. State, Country combos
-    if state_full: candidates.append(f"{state_full}, United States")
-    if state:      candidates.append(f"{state}, United States")
-    # 8. Country variants (broadest — last resort)
+
+    # ── FULL FORMATS FIRST (most specific — what most forms expect) ───────────
+    # "Sterling, Virginia, United States of America"
+    # "Sterling, Virginia, United States"
+    # "Sterling, Virginia, USA"
+    # "Sterling, VA, United States"
+    # "Sterling, VA, USA"
+    if city and state_full and state_full != state:
+        candidates.append(f"{city}, {state_full}, United States of America")
+        candidates.append(f"{city}, {state_full}, United States")
+        candidates.append(f"{city}, {state_full}, USA")
+        candidates.append(f"{city}, {state_full}, US")
+    if city and state:
+        candidates.append(f"{city}, {state}, United States")
+        candidates.append(f"{city}, {state}, USA")
+        candidates.append(f"{city}, {state}, US")
+
+    # ── CITY + STATE (no country) ─────────────────────────────────────────────
+    # "Sterling, Virginia"
+    # "Sterling, VA"
+    if city and state_full and state_full != state:
+        candidates.append(f"{city}, {state_full}")
+    if city and state:
+        candidates.append(f"{city}, {state}")
+
+    # ── PROFILE LOCATION STRING ───────────────────────────────────────────────
+    if location and location not in candidates:
+        candidates.append(location)
+
+    # ── CITY ONLY (city dropdown) ─────────────────────────────────────────────
+    if city:
+        candidates.append(city)
+
+    # ── STATE LEVEL ───────────────────────────────────────────────────────────
+    if state_full and state_full != state:
+        candidates.append(f"{state_full}, United States")
+        candidates.append(state_full)
+    # NOTE: Do NOT add bare state abbreviation — "VA" matches Vatican City ISO code
+
+    # ── COUNTRY LEVEL (last resort for country-only dropdowns) ────────────────
     candidates.extend(country_variants)
+
     # Remove duplicates while preserving order
     seen, result = set(), []
     for c in candidates:
