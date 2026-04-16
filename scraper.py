@@ -101,8 +101,10 @@ def detect_platform(url, apply_url=""):
         u = u.lower()
         if "linkedin.com"          in u: return "linkedin"
         if "indeed.com"            in u: return "indeed"
+        # All greenhouse URL variants
         if "greenhouse.io"         in u: return "greenhouse"
         if "boards-api.greenhouse" in u: return "greenhouse"
+        if "ghc.greenhouse.io"     in u: return "greenhouse"
         if "jobs.lever.co"         in u: return "lever"
         if "lever.co"              in u: return "lever"
         if "ashbyhq.com"           in u: return "ashby"
@@ -112,7 +114,7 @@ def detect_platform(url, apply_url=""):
         if "icims.com"             in u: return "icims"
         if "bamboohr.com"          in u: return "bamboohr"
         if "taleo.net"             in u: return "manual"
-        # News/community sites are NOT job application forms
+        # Community/news sites are NOT job application forms
         if "ycombinator.com"       in u: return "manual"
         if "news.ycombinator"      in u: return "manual"
         if "workatastartup.com"    in u: return "manual"
