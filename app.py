@@ -872,7 +872,8 @@ def fix_platforms():
         if plat != job.get("apply_platform"):
             db.update_job(u, job["id"], apply_platform=plat)
             fixed += 1
-    db.log(u, f"Fixed apply_platform on {fixed}/{len(jobs)} jobs")
+    if fixed:
+        db.log(u, f"Fixed apply_platform on {fixed}/{len(jobs)} jobs")
     return jsonify({"ok": True, "fixed": fixed, "total": len(jobs)})
 
 

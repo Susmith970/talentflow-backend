@@ -1538,6 +1538,9 @@ def _greenhouse_playwright(job: dict, profile: dict, username: str,
                 try:
                     unanswered = []
                     q_idx = 0
+                    seen_names = set()  # deduplicate radio groups
+
+                    # ── Pass 1: text/select/textarea inputs ───────────────────
                     for inp in page.locator("input:visible,select:visible,textarea:visible").all()[:40]:
                         try:
                             itype = (inp.get_attribute("type") or "").lower()
@@ -1555,7 +1558,6 @@ def _greenhouse_playwright(job: dict, profile: dict, username: str,
                                     "if(p.classList.contains('required'))return true;p=p.parentElement;}"
                                     "return false;}", inp.element_handle()))
                             except: pass
-
                             if not (html_req or aria_req or css_req): continue
 
                             label = (_get_label(page, inp)
@@ -1569,15 +1571,86 @@ def _greenhouse_playwright(job: dict, profile: dict, username: str,
                             if tag == "select":
                                 for opt in inp.locator("option").all():
                                     ot = (opt.inner_text() or "").strip()
-                                    if ot and ot.lower() not in ("","select","choose","please select"):
+                                    if ot and ot.lower() not in ("","select","choose","please select","-- select --"):
                                         options.append(ot)
 
+                            # Option 2: Try Claude before asking user
+                            claude_ans = ""
+                            try:
+                                claude_ans = _claude_answer(label, tag, profile, job)
+                                if claude_ans and options:
+                                    # Validate Claude's answer against options
+                                    match = next((o for o in options
+                                                  if claude_ans.lower() in o.lower() or o.lower() in claude_ans.lower()), None)
+                                    if match:
+                                        L(f"Claude pre-answered '{label[:30]}' = '{match}' (skipping ask-user)")
+                                        # Fill it right now
+                                        try:
+                                            inp.select_option(label=match)
+                                            inp.dispatch_event("change")
+                                        except: pass
+                                        q_idx += 1
+                                        continue
+                                elif claude_ans and not options:
+                                    L(f"Claude pre-answered '{label[:30]}' = '{claude_ans[:30]}' (skipping ask-user)")
+                                    try:
+                                        inp.fill(str(claude_ans))
+                                        inp.dispatch_event("input")
+                                        inp.dispatch_event("change")
+                                    except: pass
+                                    q_idx += 1
+                                    continue
+                            except: pass
+
                             unanswered.append({
-                                "id":      f"q{q_idx}",
-                                "label":   label.strip()[:80],
-                                "type":    tag,
-                                "options": options[:12],
-                                "answer":  "",
+                                "id":        f"q{q_idx}",
+                                "label":     label.strip()[:80],
+                                "type":      tag,
+                                "options":   options[:15],
+                                "answer":    "",
+                                "job_title": job.get("title","") + " @ " + job.get("company",""),
+                            })
+                            q_idx += 1
+                        except: pass
+
+                    # ── Pass 2: radio groups not yet answered ─────────────────
+                    for radio in page.locator("input[type=radio]:visible").all():
+                        try:
+                            rname = radio.get_attribute("name") or ""
+                            if not rname or rname in seen_names: continue
+                            # Check if already answered
+                            group = page.locator(f"input[type=radio][name='{rname}']:visible")
+                            if any(r.is_checked() for r in group.all()): continue
+                            seen_names.add(rname)
+
+                            label = _get_label(page, radio) or rname.replace("_"," ").replace("-"," ")
+                            options = []
+                            for r in group.all():
+                                rl = _get_label(page, r) or r.get_attribute("value") or ""
+                                if rl: options.append(rl)
+
+                            # Try Claude / profile first
+                            ans = _answer(label, profile)
+                            if not ans: ans = _claude_answer(label, "radio", profile, job)
+                            if ans and options:
+                                match = next((o for o in options
+                                              if ans.lower() in o.lower() or o.lower() in ans.lower()), None)
+                                if match:
+                                    for r in group.all():
+                                        if (_get_label(page, r) or r.get_attribute("value") or "").strip() == match:
+                                            r.click(); _jitter(0.1, 0.2)
+                                            L(f"Claude answered radio '{label[:30]}' = '{match}'")
+                                            break
+                                    continue
+
+                            # Still unanswered — ask user
+                            unanswered.append({
+                                "id":        f"q{q_idx}",
+                                "label":     label.strip()[:80],
+                                "type":      "radio",
+                                "options":   options[:8],
+                                "answer":    "",
+                                "job_title": job.get("title","") + " @ " + job.get("company",""),
                             })
                             q_idx += 1
                         except: pass
@@ -1588,10 +1661,26 @@ def _greenhouse_playwright(job: dict, profile: dict, username: str,
                         if answers:
                             # Fill the answers user provided
                             q_idx2 = 0
+                            seen_names2 = set()
                             for inp in page.locator("input:visible,select:visible,textarea:visible").all()[:40]:
                                 try:
                                     itype = (inp.get_attribute("type") or "").lower()
-                                    if itype in ("file","hidden","submit","button","radio","checkbox"):
+                                    if itype in ("file","hidden","submit","button","checkbox"):
+                                        continue
+                                    if itype == "radio":
+                                        rname = inp.get_attribute("name") or ""
+                                        if rname in seen_names2: continue
+                                        seen_names2.add(rname)
+                                        qid = f"q{q_idx2}"
+                                        if qid in answers and answers[qid]:
+                                            group = page.locator(f"input[type=radio][name='{rname}']:visible")
+                                            for r in group.all():
+                                                rl = (_get_label(page, r) or r.get_attribute("value") or "").strip()
+                                                if answers[qid].lower() in rl.lower() or rl.lower() in answers[qid].lower():
+                                                    r.click(); _jitter(0.1, 0.2)
+                                                    L(f"  ✓ User radio '{rl}'")
+                                                    break
+                                        q_idx2 += 1
                                         continue
                                     val = (inp.input_value() or "").strip()
                                     if val: q_idx2 += 1; continue
@@ -1622,8 +1711,14 @@ def _greenhouse_playwright(job: dict, profile: dict, username: str,
 
                 # 6. Check for CAPTCHA before attempting submit
                 try:
-                    cap = page.locator("iframe[src*='hcaptcha'],iframe[src*='recaptcha'],#h-captcha,.h-captcha,[data-sitekey]")
-                    if cap.count() > 0 and cap.first.is_visible():
+                    # Only real CAPTCHA iframes — NOT [data-sitekey] which GH uses for EEO widgets
+                    cap = page.locator(
+                        "iframe[src*='hcaptcha.com']:visible,"
+                        "iframe[src*='recaptcha']:visible,"
+                        "iframe[title*='captcha' i]:visible,"
+                        "#h-captcha:visible,.h-captcha:visible"
+                    )
+                    if cap.count() > 0:
                         L("⚠ CAPTCHA detected — cannot auto-submit headlessly")
                         browser.close()
                         return {"success": False, "manual": True, "platform": "greenhouse",
@@ -2585,8 +2680,13 @@ def apply_lever(job: dict, profile: dict, username: str) -> dict:
             # ── 6. Detect hCaptcha BEFORE attempting submit ──────────────
             captcha_present = False
             try:
-                cap = page.locator("iframe[src*='hcaptcha'], iframe[src*='recaptcha'], #h-captcha, .h-captcha, [data-sitekey]")
-                if cap.count() > 0 and cap.first.is_visible():
+                cap = page.locator(
+                    "iframe[src*='hcaptcha.com']:visible,"
+                    "iframe[src*='recaptcha']:visible,"
+                    "iframe[title*='captcha' i]:visible,"
+                    "#h-captcha:visible,.h-captcha:visible"
+                )
+                if cap.count() > 0:
                     captcha_present = True
                     L("⚠ hCaptcha/reCaptcha detected — cannot auto-submit")
                     L("  Marking as manual so user can complete in browser")
