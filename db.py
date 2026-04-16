@@ -404,3 +404,55 @@ def get_activity(username, n=60):
     if not path.exists(): return []
     lines=path.read_text(encoding="utf-8").strip().split("\n")
     return [l for l in reversed(lines[-n:]) if l.strip()]
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PENDING QUESTIONS — "Ask User" flow for blocked apply sessions
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def save_pending_questions(username: str, job_id: str, questions: list):
+    """Store questions the bot couldn't answer — UI will ask the user."""
+    p = DATA_DIR / f"pending_{username}_{job_id}.json"
+    # job_title stored on each question — pull it to top level for UI
+    job_title = questions[0].get("job_title","") if questions else ""
+    p.write_text(json.dumps({
+        "job_id":    job_id,
+        "username":  username,
+        "job_title": job_title,
+        "questions": questions,   # [{id, label, type, options, answer, job_title}]
+        "created":   datetime.now().isoformat(),
+        "answered":  False,
+    }, indent=2))
+
+def get_pending_questions(username: str, job_id: str) -> dict | None:
+    path = DATA_DIR / f"pending_{username}_{job_id}.json"
+    if not path.exists(): return None
+    try:    return json.loads(path.read_text())
+    except: return None
+
+def answer_pending_questions(username: str, job_id: str, answers: dict):
+    """User submitted answers — mark as answered so bot can resume."""
+    data = get_pending_questions(username, job_id)
+    if not data: return False
+    for q in data["questions"]:
+        if q["id"] in answers:
+            q["answer"] = answers[q["id"]]
+    data["answered"]    = True
+    data["answered_at"] = datetime.now().isoformat()
+    path = DATA_DIR / f"pending_{username}_{job_id}.json"
+    path.write_text(json.dumps(data, indent=2))
+    return True
+
+def clear_pending_questions(username: str, job_id: str):
+    path = DATA_DIR / f"pending_{username}_{job_id}.json"
+    if path.exists(): path.unlink()
+
+def list_pending_questions(username: str) -> list:
+    """Return all unanswered pending question sets for this user."""
+    result = []
+    for p in DATA_DIR.glob(f"pending_{username}_*.json"):
+        try:
+            d = json.loads(p.read_text())
+            if not d.get("answered"):
+                result.append(d)
+        except: pass
+    return result

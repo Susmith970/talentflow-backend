@@ -1407,6 +1407,39 @@ def _greenhouse_api(job, profile, username, board, job_id):
         return {"success": False, "reason": str(exc)[:200]}
 
 
+def _ask_user_and_wait(job: dict, username: str, unanswered: list, timeout_s: int = 300) -> dict:
+    """
+    Store unanswered questions in DB, wait up to timeout_s for user to answer via UI.
+    Returns dict of {question_id: answer_text} or {} if timed out.
+    """
+    if not unanswered:
+        return {}
+
+    job_id = job.get("id", "")
+    db.log(username, f"  [ASK] Pausing — {len(unanswered)} question(s) need user input:")
+    for q in unanswered:
+        db.log(username, f"  [ASK]   • {q['label'][:60]}")
+        q["job_title"] = job.get("title","") + " @ " + job.get("company","")
+
+    db.save_pending_questions(username, job_id, unanswered)
+
+    # Poll up to timeout_s for user answers
+    import time as _time
+    deadline = _time.time() + timeout_s
+    while _time.time() < deadline:
+        _time.sleep(5)
+        data = db.get_pending_questions(username, job_id)
+        if data and data.get("answered"):
+            answers = {q["id"]: q.get("answer","") for q in data["questions"]}
+            db.log(username, f"  [ASK] User answered {len(answers)} question(s) — resuming")
+            db.clear_pending_questions(username, job_id)
+            return answers
+
+    db.log(username, f"  [ASK] Timed out waiting for user ({timeout_s}s) — marking manual")
+    db.clear_pending_questions(username, job_id)
+    return {}
+
+
 def _greenhouse_playwright(job: dict, profile: dict, username: str,
                             apply_url: str) -> dict:
     """Greenhouse via Playwright — handles multi-page forms, radios, selects."""
@@ -1442,15 +1475,22 @@ def _greenhouse_playwright(job: dict, profile: dict, username: str,
                 input_count = page.locator("input:visible").count()
                 L(f"Visible inputs: {input_count}")
 
-                # 1. Resume upload
+                # 1. Resume upload — wait up to 30s for autofill after upload
                 if resume_path and Path(resume_path).exists():
-                    for fi_sel in ("#resume","input[id*=resume]","input[name*=resume]"):
+                    for fi_sel in ("#resume","input[id*=resume]","input[name*=resume]",
+                                   "input[type=file]"):
                         fi = page.locator(fi_sel)
                         if fi.count() > 0:
                             try:
                                 fi.first.set_input_files(resume_path)
-                                L(f"✓ Resume uploaded via {fi_sel}")
-                                _jitter(2, 3)
+                                L(f"✓ Resume uploaded via {fi_sel} — waiting 30s for autofill…")
+                                # Wait for autofill: Greenhouse parses resume and fills fields
+                                for wait_tick in range(30):
+                                    _jitter(0.9, 1.1)  # ~30s total
+                                    # Stop early if fields start appearing
+                                    if page.locator("#first_name:not([value=''])").count() > 0:
+                                        L(f"  Autofill detected after {wait_tick+1}s")
+                                        break
                                 break
                             except Exception: pass
 
@@ -1493,6 +1533,92 @@ def _greenhouse_playwright(job: dict, profile: dict, username: str,
 
                 # 5. Pre-submit audit
                 _audit_form(page, username)
+
+                # 5b. Collect still-empty required fields and ask user (Option 3)
+                try:
+                    unanswered = []
+                    q_idx = 0
+                    for inp in page.locator("input:visible,select:visible,textarea:visible").all()[:40]:
+                        try:
+                            itype = (inp.get_attribute("type") or "").lower()
+                            if itype in ("file","hidden","submit","button","radio","checkbox"):
+                                continue
+                            val = (inp.input_value() or "").strip()
+                            if val: continue  # already filled
+
+                            html_req = inp.get_attribute("required") is not None
+                            aria_req = inp.get_attribute("aria-required") == "true"
+                            css_req  = False
+                            try:
+                                css_req = bool(page.evaluate(
+                                    "el=>{let p=el.parentElement;for(let i=0;i<4;i++){if(!p)break;"
+                                    "if(p.classList.contains('required'))return true;p=p.parentElement;}"
+                                    "return false;}", inp.element_handle()))
+                            except: pass
+
+                            if not (html_req or aria_req or css_req): continue
+
+                            label = (_get_label(page, inp)
+                                     or inp.get_attribute("placeholder")
+                                     or inp.get_attribute("aria-label")
+                                     or inp.get_attribute("name") or "?")
+
+                            # Build options list for selects
+                            options = []
+                            tag = inp.evaluate("el=>el.tagName.toLowerCase()")
+                            if tag == "select":
+                                for opt in inp.locator("option").all():
+                                    ot = (opt.inner_text() or "").strip()
+                                    if ot and ot.lower() not in ("","select","choose","please select"):
+                                        options.append(ot)
+
+                            unanswered.append({
+                                "id":      f"q{q_idx}",
+                                "label":   label.strip()[:80],
+                                "type":    tag,
+                                "options": options[:12],
+                                "answer":  "",
+                            })
+                            q_idx += 1
+                        except: pass
+
+                    if unanswered:
+                        L(f"⏸ {len(unanswered)} required field(s) still empty — asking user")
+                        answers = _ask_user_and_wait(job, username, unanswered, timeout_s=300)
+                        if answers:
+                            # Fill the answers user provided
+                            q_idx2 = 0
+                            for inp in page.locator("input:visible,select:visible,textarea:visible").all()[:40]:
+                                try:
+                                    itype = (inp.get_attribute("type") or "").lower()
+                                    if itype in ("file","hidden","submit","button","radio","checkbox"):
+                                        continue
+                                    val = (inp.input_value() or "").strip()
+                                    if val: q_idx2 += 1; continue
+                                    qid = f"q{q_idx2}"
+                                    if qid in answers and answers[qid]:
+                                        tag = inp.evaluate("el=>el.tagName.toLowerCase()")
+                                        if tag == "select":
+                                            try: inp.select_option(label=answers[qid])
+                                            except:
+                                                try: inp.select_option(value=answers[qid])
+                                                except: pass
+                                        else:
+                                            inp.fill(str(answers[qid]))
+                                        inp.dispatch_event("input")
+                                        inp.dispatch_event("change")
+                                        _jitter(0.1, 0.2)
+                                        L(f"  ✓ User answered '{answers[qid][:30]}'")
+                                    q_idx2 += 1
+                                except: pass
+                        else:
+                            # No answers — go manual
+                            browser.close()
+                            return {"success": False, "manual": True, "platform": "greenhouse",
+                                    "reason": "Required fields unanswered — timed out waiting for user",
+                                    "apply_url": apply_url}
+                except Exception as ask_err:
+                    L(f"Ask-user error: {ask_err}")
 
                 # 6. Check for CAPTCHA before attempting submit
                 try:
@@ -1952,6 +2078,72 @@ def _fill_all(page, profile: dict, job: dict, cover: str, username: str):
                         L(f"  ✗ select '{label[:25]}' didn't stick (JS reset?) val='{new_val}'")
                 except Exception as se:
                     L(f"  ✗ select error: {se}")
+        except Exception: pass
+
+    # ── Greenhouse custom <div> dropdowns (select2 / chosen.js) ─────────────
+    # GH renders some selects as styled <div> containers with role="listbox"
+    for wrapper in page.locator(
+        "[data-select-type]:visible, "
+        ".select__wrapper:visible, "
+        ".chosen-container:visible, "
+        "[class*='select-field']:visible, "
+        "[role='combobox']:visible"
+    ).all():
+        try:
+            if not wrapper.is_visible(): continue
+            # Get label for this widget
+            label = ""
+            try:
+                label_el = wrapper.locator("label, .label, [class*='label']")
+                if label_el.count() > 0: label = label_el.first.inner_text().strip()
+            except: pass
+            if not label:
+                label = (wrapper.get_attribute("aria-label") or
+                         wrapper.get_attribute("data-field-id") or "")
+            combined = label.lower()
+
+            # Check if already selected
+            try:
+                selected = wrapper.locator("[aria-selected='true'], .selected, .chosen-single")
+                if selected.count() > 0 and selected.first.inner_text().strip():
+                    continue  # already has a value
+            except: pass
+
+            val = _answer(combined, profile)
+            if not val:
+                val = _claude_answer(label or combined, "select", profile, job)
+            if not val: continue
+
+            # Click to open the dropdown
+            trigger = wrapper.locator("button, .select-button, [role='button'], input[type='text']")
+            if trigger.count() > 0: trigger.first.click()
+            else: wrapper.click()
+            _jitter(0.3, 0.6)
+
+            # Pick matching option from the opened list
+            for opt_sel in ("ul[role=listbox] li:visible",
+                            "[role=option]:visible",
+                            ".select-option:visible",
+                            ".chosen-results li:visible"):
+                opts = page.locator(opt_sel).all()
+                if not opts: continue
+                for opt in opts:
+                    ot = (opt.inner_text() or "").strip()
+                    if not ot or ot.lower() in ("select","choose","-- select --","none",""):
+                        continue
+                    if val.lower() in ot.lower() or ot.lower() in val.lower():
+                        opt.click()
+                        filled.append(f"{label[:20]}(gh-div)={ot[:15]}")
+                        L(f"  ✓ div-select '{label[:25]}' = '{ot[:20]}'")
+                        _jitter(0.2, 0.4)
+                        break
+                else:
+                    continue
+                break
+            else:
+                # Close without selecting if nothing matched
+                try: page.keyboard.press("Escape")
+                except: pass
         except Exception: pass
 
     # ── Radio buttons ────────────────────────────────────────────────────────

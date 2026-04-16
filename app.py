@@ -857,6 +857,37 @@ def billing_status():
                     "status": profile.get("subscription_status","")})
 
 
+# ── Pending Questions ("Ask User" flow) ───────────────────────────────────────
+
+@app.get("/api/apply/pending")
+def get_pending():
+    """Poll for questions the bot couldn't answer — UI shows these to the user."""
+    u = require_auth()
+    pending = db.list_pending_questions(u)
+    return jsonify({"pending": pending})
+
+@app.post("/api/apply/pending/<job_id>/answer")
+def answer_pending(job_id):
+    """User submits answers — bot will resume and fill them in."""
+    u = require_auth()
+    body    = request.json or {}
+    answers = body.get("answers", {})   # {q0: "Yes", q1: "No", ...}
+    if not answers:
+        return jsonify({"error": "answers dict required"}), 400
+    ok = db.answer_pending_questions(u, job_id, answers)
+    if not ok:
+        return jsonify({"error": "No pending questions found for this job"}), 404
+    db.log(u, f"User answered pending questions for job {job_id}")
+    return jsonify({"ok": True, "message": "Answers saved — bot will resume shortly"})
+
+@app.delete("/api/apply/pending/<job_id>")
+def dismiss_pending(job_id):
+    """Dismiss pending questions (skip / mark manual)."""
+    u = require_auth()
+    db.clear_pending_questions(u, job_id)
+    return jsonify({"ok": True})
+
+
 # ── Activity & health ─────────────────────────────────────────────────────────
 
 @app.get("/api/activity")
