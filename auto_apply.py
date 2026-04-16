@@ -1459,6 +1459,17 @@ def _greenhouse_playwright(job: dict, profile: dict, username: str,
                 # 5. Pre-submit audit
                 _audit_form(page, username)
 
+                # 6. Check for CAPTCHA before attempting submit
+                try:
+                    cap = page.locator("iframe[src*='hcaptcha'],iframe[src*='recaptcha'],#h-captcha,.h-captcha,[data-sitekey]")
+                    if cap.count() > 0 and cap.first.is_visible():
+                        L("⚠ CAPTCHA detected — cannot auto-submit headlessly")
+                        browser.close()
+                        return {"success": False, "manual": True, "platform": "greenhouse",
+                                "reason": "CAPTCHA present — open link and submit manually",
+                                "apply_url": apply_url}
+                except Exception: pass
+
                 # 6. Look for Next or Submit
                 next_btn = None
                 submit_btn = None
@@ -1688,8 +1699,19 @@ def _fill_all(page, profile: dict, job: dict, cover: str, username: str):
 
             if val and any(b in str(val).lower() for b in BAD_URLS): val=""
             if val:
-                inp.fill(str(val)); filled.append(f"{label[:20] or attrs[:20]}={str(val)[:15]}")
-                _jitter(0.05, 0.15)
+                inp.fill(str(val))
+                # For autocomplete fields, trigger events to commit the value
+                try:
+                    inp.dispatch_event("input")
+                    inp.dispatch_event("change")
+                    _jitter(0.1, 0.2)
+                    # If it's a location/city autocomplete, try pressing Enter or Tab
+                    if any(x in combined for x in ("location","city","where")):
+                        inp.press("Tab")
+                        _jitter(0.3, 0.5)
+                except Exception: pass
+                filled.append(f"{label[:20] or attrs[:20]}={str(val)[:15]}")
+                _jitter(0.05, 0.1)
         except Exception: pass
 
     # ── Select dropdowns ─────────────────────────────────────────────────────
@@ -2230,6 +2252,21 @@ def apply_lever(job: dict, profile: dict, username: str) -> dict:
 
             # ── 5. Pre-submit audit ────────────────────────────────────────
             _audit_form(page, username)
+
+            # ── 6. Detect hCaptcha BEFORE attempting submit ──────────────
+            captcha_present = False
+            try:
+                cap = page.locator("iframe[src*='hcaptcha'], iframe[src*='recaptcha'], #h-captcha, .h-captcha, [data-sitekey]")
+                if cap.count() > 0 and cap.first.is_visible():
+                    captcha_present = True
+                    L("⚠ hCaptcha/reCaptcha detected — cannot auto-submit")
+                    L("  Marking as manual so user can complete in browser")
+            except Exception: pass
+            if captcha_present:
+                browser.close()
+                return {"success": False, "manual": True, "platform": "lever",
+                        "reason": "CAPTCHA present — open the link and complete manually",
+                        "apply_url": apply_url}
 
             # ── 6. Find and click Submit ───────────────────────────────────
             sub_btn = None
