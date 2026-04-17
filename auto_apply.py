@@ -1659,30 +1659,82 @@ def _greenhouse_playwright(job: dict, profile: dict, username: str,
                             if any(r.is_checked() for r in group.all()): continue
                             seen_names.add(rname)
 
-                            label = _get_label(page, radio) or rname.replace("_"," ").replace("-"," ")
-                            options = []
+                            # Get GROUP label (the question text) from fieldset/legend
+                            group_label = ""
+                            try:
+                                group_label = page.evaluate("""(el) => {
+                                    // Walk up to find fieldset legend or nearby label
+                                    let p = el.parentElement;
+                                    for (let i=0; i<8; i++) {
+                                        if (!p) break;
+                                        const leg = p.querySelector('legend');
+                                        if (leg) return leg.innerText.trim();
+                                        const lbl = p.querySelector('label:not([for]),.label,.field-label,[class*="label"]');
+                                        if (lbl && !lbl.htmlFor) return lbl.innerText.trim();
+                                        p = p.parentElement;
+                                    }
+                                    return '';
+                                }""", radio.element_handle())
+                            except: pass
+                            label = group_label or rname.replace("_"," ").replace("-"," ")
+
+                            # Get OPTION labels using label[for=id] — NOT _get_label which returns group label
+                            options = []  # list of (option_text, radio_element) pairs
                             for r in group.all():
-                                rl = _get_label(page, r) or r.get_attribute("value") or ""
-                                if rl: options.append(rl)
+                                try:
+                                    rid = r.get_attribute("id") or ""
+                                    opt_text = ""
+                                    if rid:
+                                        lf_sel = f"label[for=\"{rid}\"]"
+                                    opt_text = page.evaluate(
+                                        f"document.querySelector('{lf_sel}')?.innerText?.trim() || ''")
+                                    if not opt_text:
+                                        # Fallback: adjacent text node
+                                        opt_text = page.evaluate("""(el) => {
+                                            const sib = el.nextSibling;
+                                            if (sib && sib.nodeType===3) return sib.textContent.trim();
+                                            const lbl = el.nextElementSibling;
+                                            if (lbl && lbl.tagName==='LABEL') return lbl.innerText.trim();
+                                            return el.value || '';
+                                        }""", r.element_handle())
+                                    if opt_text: options.append(opt_text)
+                                except: pass
+
+                            # Skip groups where all "options" look like internal IDs (numbers only)
+                            real_options = [o for o in options if not o.strip().isdigit() and len(o) > 1]
 
                             # Try profile _answer first, then Claude
                             REFUSE_PHRASES2 = ("i don't have","i cannot","not provided",
                                                "cannot determine","no information","unknown")
                             ans = _answer(label, profile)
-                            if not ans:
-                                ans = _claude_answer(label, "radio", profile, job)
+                            if not ans and real_options:
+                                ans = _claude_answer(
+                                    f"{label} (choose one: {', '.join(real_options[:6])})",
+                                    "radio", profile, job)
                                 if ans and any(rp in ans.lower() for rp in REFUSE_PHRASES2):
-                                    ans = ""  # Claude refused — ask user
-                            if ans and options:
-                                match = next((o for o in options
+                                    ans = ""
+                            if ans and real_options:
+                                match = next((o for o in real_options
                                               if ans.lower() in o.lower() or o.lower() in ans.lower()), None)
                                 if match:
+                                    # Click the radio whose label[for=id] matches
                                     for r in group.all():
-                                        if (_get_label(page, r) or r.get_attribute("value") or "").strip() == match:
-                                            r.click(); _jitter(0.1, 0.2)
-                                            L(f"Answered radio '{label[:30]}' = '{match}'")
-                                            break
+                                        try:
+                                            rid = r.get_attribute("id") or ""
+                                            lf_sel2 = f"label[for=\"{rid}\"]"
+                                            opt_text = (page.evaluate(
+                                                f"document.querySelector('{lf_sel2}')?.innerText?.trim() || ''")
+                                                or "")
+                                            if match.lower() in opt_text.lower() or opt_text.lower() in match.lower():
+                                                r.click(); _jitter(0.2, 0.4)
+                                                L(f"✓ Radio '{label[:30]}' = '{match}'")
+                                                break
+                                        except: pass
                                     continue  # answered — don't ask user
+
+                            # Skip if all options are numeric IDs (Greenhouse "how did you hear" sub-radios)
+                            if not real_options:
+                                continue
 
                             # Still unanswered — ask user
                             unanswered.append({
@@ -1760,11 +1812,21 @@ def _greenhouse_playwright(job: dict, profile: dict, username: str,
                         "#h-captcha:visible,.h-captcha:visible"
                     )
                     if cap.count() > 0:
+                        # Log what triggered it
+                        try:
+                            for c in cap.all()[:3]:
+                                src_attr  = c.get_attribute("src") or ""
+                                title_attr = c.get_attribute("title") or ""
+                                cls_attr  = c.get_attribute("class") or ""
+                                L(f"  CAPTCHA element: src={src_attr[:60]} title={title_attr[:40]} class={cls_attr[:30]}")
+                        except: pass
                         L("⚠ CAPTCHA detected — cannot auto-submit headlessly")
                         browser.close()
                         return {"success": False, "manual": True, "platform": "greenhouse",
                                 "reason": "CAPTCHA present — open link and submit manually",
                                 "apply_url": apply_url}
+                    else:
+                        L("✓ No CAPTCHA detected — proceeding to submit")
                 except Exception: pass
 
                 # 6. Look for Next or Submit
@@ -2494,10 +2556,11 @@ def _audit_form(page, username: str):
         # Broader selector: also catch fields inside .required wrappers (Lever style)
         for inp in page.locator(
             "input:visible, select:visible, textarea:visible"
-        ).all()[:40]:
+        ).all()[:50]:
             try:
                 itype = inp.get_attribute("type") or ""
-                if itype in ("file","hidden","submit","button","reset"): continue
+                # Skip non-fillable types; skip radio (tracked separately via fieldsets)
+                if itype in ("file","hidden","submit","button","reset","radio","checkbox"): continue
 
                 # Get best label
                 label = (_get_label(page, inp)
