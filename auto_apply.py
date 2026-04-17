@@ -340,8 +340,12 @@ def _answer(question: str, profile: dict) -> str:
         return profile.get("disability_status","I do not have a disability")
     if any(x in q for x in ("gender","gender identity","sex","sexual")):
         return profile.get("gender","Male")
-    if any(x in q for x in ("race","ethnicity","hispanic","latino","ancestry")):
-        return profile.get("race_ethnicity","Asian")
+    # "Are you Hispanic/Latino?" is a Yes/No question — different from race/ethnicity
+    if any(x in q for x in ("hispanic","latino")):
+        re_val = (profile.get("race_ethnicity","") or "").lower()
+        return "Yes" if ("hispanic" in re_val or "latino" in re_val) else "No"
+    if any(x in q for x in ("race","ethnicity","ancestry")):
+        return profile.get("race_ethnicity","Prefer not to say")
     if any(x in q for x in ("lgbt","lgbtq","lgbtqia","sexual orientation",
                               "identify as part of","gender identity or expression",
                               "transgender","nonbinary","non-binary")):
@@ -449,10 +453,18 @@ Years experience: {profile.get("years_experience","")}
 Current role: {(profile.get("experience") or [{}])[0].get("title","")} at {(profile.get("experience") or [{}])[0].get("company","")}
 Recent experience: {exp_summary}
 Skills: {skills}
-Location: {profile.get("location","")}
+Location: {profile.get("location","")} (City: {profile.get("address_city","")}, State: {profile.get("address_state","")}, Country: {profile.get("address_country","United States")})
 Education: {(profile.get("education") or [{}])[0].get("degree","")} from {(profile.get("education") or [{}])[0].get("school","")}
 Work authorized: {profile.get("work_authorized","Yes")}
 Requires sponsorship: {profile.get("requires_sponsorship","No")}
+Citizenship status: {profile.get("citizenship_status","")}
+Gender: {profile.get("gender","Prefer not to say")}
+Race/Ethnicity: {profile.get("race_ethnicity","Prefer not to say")}
+Hispanic/Latino: {"Yes" if "hispanic" in (profile.get("race_ethnicity","")).lower() else "No"}
+Veteran status: {profile.get("veteran_status","I am not a protected veteran")}
+Disability status: {profile.get("disability_status","I do not have a disability")}
+Salary expectation: {profile.get("salary_expectation","")}
+Start date: {profile.get("start_date","")}
 
 Job being applied to:
 Title: {job.get("title","")}
@@ -606,8 +618,15 @@ def _select(label: str, options: list, profile: dict) -> str:
         if gd == "female": return first("female","woman") or (non_placeholder_opts()[0] if non_placeholder_opts() else None)
         return first("prefer not","decline","other","non-binary") or (non_placeholder_opts()[0] if non_placeholder_opts() else None)
 
+    # Hispanic/Latino — Yes/No question (NOT the same as race/ethnicity)
+    if any(x in lab for x in ("hispanic","latino")):
+        re_val = (profile.get("race_ethnicity","") or "").lower()
+        is_hispanic = "hispanic" in re_val or "latino" in re_val
+        if is_hispanic: return first("yes","i am","hispanic") or (non_placeholder_opts()[0] if non_placeholder_opts() else None)
+        return first("no","i am not","not hispanic","prefer not","decline") or (non_placeholder_opts()[0] if non_placeholder_opts() else None)
+
     # Race / ethnicity
-    if any(x in lab for x in ("race","ethnic","hispanic","origin")):
+    if any(x in lab for x in ("race","ethnic","origin")):
         re_val = (profile.get("race_ethnicity","Prefer not to say") or "").lower()
         return match_answer(re_val) or first("prefer not","decline","not specified") or (non_placeholder_opts()[0] if non_placeholder_opts() else None)
 
@@ -1528,8 +1547,13 @@ def _greenhouse_playwright(job: dict, profile: dict, username: str,
                             break
                         except Exception: pass
 
-                # 4. Full form fill (text, select, radio, checkbox)
+                # 4. Full form fill — run TWICE because:
+                #    a) Greenhouse renders fields twice (desktop+mobile)
+                #    b) React may reset selects after first fill
+                #    c) Some fields appear after others are filled (EEO section)
                 _fill_all(page, profile, job, cover, username)
+                _jitter(1.0, 1.5)  # wait for React to settle
+                _fill_all(page, profile, job, cover, username)  # second pass catches resets
 
                 # 5. Pre-submit audit
                 _audit_form(page, username)
@@ -1574,33 +1598,45 @@ def _greenhouse_playwright(job: dict, profile: dict, username: str,
                                     if ot and ot.lower() not in ("","select","choose","please select","-- select --"):
                                         options.append(ot)
 
-                            # Option 2: Try Claude before asking user
+                            # Option 2: Try profile _answer first (direct lookup)
+                            # then Claude — only skip ask-user if we get a REAL answer
+                            REFUSE_PHRASES = ("i don't have","i cannot","not provided",
+                                              "i do not have information","cannot determine",
+                                              "no information","not specified","unknown")
                             claude_ans = ""
+                            filled_by_claude = False
                             try:
                                 claude_ans = _claude_answer(label, tag, profile, job)
+                                # Reject Claude answers that are refusals
+                                if claude_ans and any(rp in claude_ans.lower() for rp in REFUSE_PHRASES):
+                                    L(f"Claude refused '{label[:30]}' — will ask user")
+                                    claude_ans = ""
                                 if claude_ans and options:
-                                    # Validate Claude's answer against options
+                                    # Validate against option list
                                     match = next((o for o in options
-                                                  if claude_ans.lower() in o.lower() or o.lower() in claude_ans.lower()), None)
+                                                  if claude_ans.lower() in o.lower()
+                                                  or o.lower() in claude_ans.lower()), None)
                                     if match:
-                                        L(f"Claude pre-answered '{label[:30]}' = '{match}' (skipping ask-user)")
-                                        # Fill it right now
+                                        L(f"Claude answered '{label[:30]}' = '{match}'")
                                         try:
                                             inp.select_option(label=match)
                                             inp.dispatch_event("change")
+                                            _jitter(0.1,0.2)
+                                            filled_by_claude = True
                                         except: pass
-                                        q_idx += 1
-                                        continue
+                                    # else: no match → fall through to ask-user
                                 elif claude_ans and not options:
-                                    L(f"Claude pre-answered '{label[:30]}' = '{claude_ans[:30]}' (skipping ask-user)")
+                                    L(f"Claude answered '{label[:30]}' = '{claude_ans[:30]}'")
                                     try:
                                         inp.fill(str(claude_ans))
                                         inp.dispatch_event("input")
                                         inp.dispatch_event("change")
+                                        filled_by_claude = True
                                     except: pass
-                                    q_idx += 1
-                                    continue
                             except: pass
+                            if filled_by_claude:
+                                q_idx += 1
+                                continue
 
                             unanswered.append({
                                 "id":        f"q{q_idx}",
@@ -1629,9 +1665,14 @@ def _greenhouse_playwright(job: dict, profile: dict, username: str,
                                 rl = _get_label(page, r) or r.get_attribute("value") or ""
                                 if rl: options.append(rl)
 
-                            # Try Claude / profile first
+                            # Try profile _answer first, then Claude
+                            REFUSE_PHRASES2 = ("i don't have","i cannot","not provided",
+                                               "cannot determine","no information","unknown")
                             ans = _answer(label, profile)
-                            if not ans: ans = _claude_answer(label, "radio", profile, job)
+                            if not ans:
+                                ans = _claude_answer(label, "radio", profile, job)
+                                if ans and any(rp in ans.lower() for rp in REFUSE_PHRASES2):
+                                    ans = ""  # Claude refused — ask user
                             if ans and options:
                                 match = next((o for o in options
                                               if ans.lower() in o.lower() or o.lower() in ans.lower()), None)
@@ -1639,9 +1680,9 @@ def _greenhouse_playwright(job: dict, profile: dict, username: str,
                                     for r in group.all():
                                         if (_get_label(page, r) or r.get_attribute("value") or "").strip() == match:
                                             r.click(); _jitter(0.1, 0.2)
-                                            L(f"Claude answered radio '{label[:30]}' = '{match}'")
+                                            L(f"Answered radio '{label[:30]}' = '{match}'")
                                             break
-                                    continue
+                                    continue  # answered — don't ask user
 
                             # Still unanswered — ask user
                             unanswered.append({
