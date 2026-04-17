@@ -1619,10 +1619,10 @@ def _greenhouse_playwright(job: dict, profile: dict, username: str,
                                     if match:
                                         L(f"Claude answered '{label[:30]}' = '{match}'")
                                         try:
-                                            inp.select_option(label=match)
-                                            inp.dispatch_event("change")
-                                            _jitter(0.1,0.2)
-                                            filled_by_claude = True
+                                            stuck = _react_fill_select(page, inp, match)
+                                            filled_by_claude = stuck
+                                            if not stuck:
+                                                L(f"  ✗ select didn't stick — will ask user")
                                         except: pass
                                     # else: no match → fall through to ask-user
                                 elif claude_ans and not options:
@@ -1729,16 +1729,16 @@ def _greenhouse_playwright(job: dict, profile: dict, username: str,
                                     if qid in answers and answers[qid]:
                                         tag = inp.evaluate("el=>el.tagName.toLowerCase()")
                                         if tag == "select":
-                                            try: inp.select_option(label=answers[qid])
-                                            except:
-                                                try: inp.select_option(value=answers[qid])
-                                                except: pass
+                                            stuck = _react_fill_select(page, inp, answers[qid])
+                                            L(f"  {'✓' if stuck else '✗'} User select '{answers[qid][:25]}' {'stuck' if stuck else 'DID NOT STICK'}")
                                         else:
-                                            inp.fill(str(answers[qid]))
-                                        inp.dispatch_event("input")
-                                        inp.dispatch_event("change")
-                                        _jitter(0.1, 0.2)
-                                        L(f"  ✓ User answered '{answers[qid][:30]}'")
+                                            try:
+                                                inp.fill(str(answers[qid]))
+                                                inp.dispatch_event("input")
+                                                inp.dispatch_event("change")
+                                                _jitter(0.1, 0.2)
+                                            except: pass
+                                            L(f"  ✓ User answered '{answers[qid][:30]}'")
                                     q_idx2 += 1
                                 except: pass
                         else:
@@ -1999,6 +1999,64 @@ def _dedup(lst: list) -> list:
     return out
 
 
+def _react_fill_select(page, sel_el, target_label: str, target_value: str = "") -> bool:
+    """
+    Fill a <select> in a way React actually sees.
+    Uses native property setter + _valueTracker reset so React controlled
+    components don't reset the value on next render.
+    Returns True if value stuck.
+    """
+    try:
+        # Method 1: Playwright select_option
+        try:
+            if target_value:
+                sel_el.select_option(value=target_value)
+            else:
+                sel_el.select_option(label=target_label)
+        except Exception: pass
+
+        # Method 2: React native setter — bypasses synthetic event system
+        page.evaluate("""
+            (args) => {
+                const sel  = args.el;
+                const val  = args.val;
+                const lbl  = args.lbl;
+                let matched = null;
+                for (let opt of sel.options) {
+                    const ot = opt.text.trim().toLowerCase();
+                    const ov = (opt.value||'').toLowerCase();
+                    const tl = lbl.toLowerCase();
+                    const tv = val.toLowerCase();
+                    if (ov===tv || ot===tl || ot.startsWith(tl) || tl.startsWith(ot)
+                        || ot.includes(tl) || tl.includes(ot)) {
+                        matched = opt; break;
+                    }
+                }
+                if (!matched) return false;
+                // Reset React value tracker
+                try { const t=sel._valueTracker; if(t) t.setValue(''); } catch(e){}
+                // Native setter — React doesn't intercept this
+                const ns = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype,'value').set;
+                ns.call(sel, matched.value);
+                matched.selected = true;
+                // Fire all events React listens for
+                ['input','change','blur'].forEach(ev => {
+                    sel.dispatchEvent(new Event(ev,{bubbles:true,cancelable:true}));
+                    sel.dispatchEvent(new InputEvent(ev,{bubbles:true,cancelable:true}));
+                });
+                return true;
+            }
+        """, {"el": sel_el.element_handle(), "val": target_value, "lbl": target_label})
+
+        # Verify it stuck
+        _jitter(0.3, 0.5)
+        new_val = (sel_el.input_value() or "").strip()
+        skip = {"","select","-- select --","choose","0","none","please select"}
+        return bool(new_val) and new_val.lower() not in skip
+    except Exception:
+        return False
+
+
 def _fill_all(page, profile: dict, job: dict, cover: str, username: str):
     """Fill every visible field: text, select, radio, checkbox."""
     def L(msg): db.log(username, f"  [FF] {msg}")
@@ -2233,49 +2291,8 @@ def _fill_all(page, profile: dict, job: dict, cover: str, username: str):
                             sel_el.select_option(label=matched_label)
                     except Exception: pass
 
-                    # Method 2: React native setter + value tracker reset + all events
-                    try:
-                        page.evaluate("""
-                            (args) => {
-                                const sel = args.el;
-                                const val = args.val;
-                                const lbl = args.lbl;
-                                let matched_opt = null;
-                                for (let opt of sel.options) {
-                                    const ot = opt.text.trim().toLowerCase();
-                                    const ov = (opt.value||'').toLowerCase();
-                                    const vl = lbl.toLowerCase();
-                                    if (ov===val.toLowerCase()||ot===vl||ot.includes(vl)||vl.includes(ot)){
-                                        matched_opt = opt; break;
-                                    }
-                                }
-                                // Fallback: first real option
-                                if (!matched_opt) {
-                                    for (let opt of sel.options) {
-                                        if (opt.value && opt.value !== '0' && opt.value !== '') {
-                                            matched_opt = opt; break;
-                                        }
-                                    }
-                                }
-                                if (!matched_opt) return;
-                                // Reset React's value tracker so it sees the change
-                                try {
-                                    const tracker = sel._valueTracker;
-                                    if (tracker) tracker.setValue('');
-                                } catch(e) {}
-                                // Use native setter — bypasses React synthetic event system
-                                const nativeSetter = Object.getOwnPropertyDescriptor(
-                                    HTMLSelectElement.prototype, 'value').set;
-                                nativeSetter.call(sel, matched_opt.value);
-                                matched_opt.selected = true;
-                                // Fire all events React/Greenhouse listens to
-                                ['input', 'change', 'blur'].forEach(ev => {
-                                    sel.dispatchEvent(new Event(ev, {bubbles:true, cancelable:true}));
-                                    sel.dispatchEvent(new InputEvent(ev, {bubbles:true, cancelable:true}));
-                                });
-                            }
-                        """, {"el": sel_el.element_handle(), "val": target_value, "lbl": target_label})
-                    except Exception: pass
+                    # Method 2: React-safe fill via _react_fill_select
+                    _react_fill_select(page, sel_el, target_label, target_value)
 
                     # Country dropdown → wait longer for state options to load
                     if is_location_field and field_hint == "country":
@@ -2440,7 +2457,10 @@ def _fill_all(page, profile: dict, job: dict, cover: str, username: str):
             # Auto-check: background check consent, terms, privacy, EEO
             auto_check = any(x in ll for x in (
                 "background","drug","authorize","i agree","i confirm",
-                "terms","privacy","certify","acknowledge","eeo","voluntary"))
+                "terms","privacy","certify","acknowledge","eeo","voluntary",
+                "adheres","applicable law","consent to","by checking",
+                "i understand","agree to","accept","attest","i certify",
+                "please review","i have read","robinhood adheres"))
             if auto_check and not chk.is_checked():
                 chk.click(); _jitter(0.1, 0.2)
                 filled.append(f"checkbox={label[:25]}")
@@ -2486,7 +2506,19 @@ def _audit_form(page, username: str):
                          or inp.get_attribute("aria-label")
                          or "?")
                 label = label.strip()[:35]
-                val   = (inp.input_value() or "").strip()
+                # For selects, read the displayed text (not the value attr)
+                tag_name = ""
+                try: tag_name = inp.evaluate("el=>el.tagName.toLowerCase()")
+                except: pass
+                if tag_name == "select":
+                    val = inp.evaluate(
+                        "el => { const o=el.options[el.selectedIndex]; return o?o.text.trim():'' }"
+                    ) or ""
+                    val = val.strip()
+                    if val.lower() in ("select","choose","-- select --","please select","none",""):
+                        val = ""
+                else:
+                    val = (inp.input_value() or "").strip()
 
                 # Detect required: HTML attr OR aria-required OR parent has .required class
                 html_req  = inp.get_attribute("required") is not None
