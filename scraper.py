@@ -1,31 +1,30 @@
-"""TalentFlow Scraper — Maximum Coverage + FAANG Direct + H1B Sponsors + Apify
+"""TalentFlow Scraper — Maximum Coverage + FAANG + H1B Sponsors + Apify
 Sources:
-  1. LinkedIn       — public HTML search (multiple queries, pagination)
-  2. LinkedIn RSS   — job alert RSS feeds (free, reliable)
-  3. We Work Remotely — official RSS (5 categories)
-  4. RemoteOK       — free JSON API
-  5. Jobright.ai    — JSON-LD structured data
-  6. Arbeitnow      — free REST API
-  7. Jobicy         — free REST API
-  8. HN Who's Hiring — Algolia API
-  9. YC Jobs        — public JSON
- 10. Greenhouse API — public board listings (incl. H1B sponsors)
- 11. Lever          — public job board API (incl. H1B sponsors)
- 12. Remotive       — free API
- 13. Otta           — tech jobs API
- 14. FindWork.dev   — tech jobs API
- 15. USAJobs.gov    — federal + contract tech jobs
- 16. Google Jobs    — direct careers.google.com API
- 17. Amazon Jobs    — direct amazon.jobs API
- 18. Apple Jobs     — direct jobs.apple.com API
- 19. Microsoft Jobs — direct careers.microsoft.com API
- 20. Meta Jobs      — direct metacareers.com API
- 21. Netflix Jobs   — direct jobs.netflix.com API
- 22. Apify          — LinkedIn/Indeed scraper (APIFY_API_TOKEN env var)
+  1.  LinkedIn       — public HTML search (multiple queries, pagination)
+  2.  LinkedIn RSS   — job alert RSS feeds (free, reliable)
+  3.  We Work Remotely — official RSS (5 categories)
+  4.  RemoteOK       — free JSON API
+  5.  Jobright.ai    — JSON-LD structured data
+  6.  Arbeitnow      — free REST API
+  7.  Jobicy         — free REST API
+  8.  HN Who's Hiring — Algolia API
+  9.  YC Jobs        — public JSON
+ 10.  Greenhouse API — public board listings (148 boards, incl. H1B sponsors)
+ 11.  Lever          — public job board API (incl. Netflix, H1B sponsors)
+ 12.  Remotive       — free API
+ 13.  Otta           — tech jobs API
+ 14.  FindWork.dev   — tech jobs API
+ 15.  USAJobs.gov    — federal + contract tech jobs
+ 16.  Amazon Jobs    — direct amazon.jobs API (genuine public API)
+ 17.  Ashby boards   — free public board API (OpenAI, Groq, Perplexity, ElevenLabs …)
+ 18.  JSearch        — RapidAPI Google/Apple/Microsoft/Meta (RAPIDAPI_KEY env var)
+ 19.  Apify          — LinkedIn/Indeed scraper (APIFY_API_TOKEN env var)
 
 All sources deduplicated, filtered to last 24 hours, role-matched.
+Note: Google/Apple/Microsoft/Meta direct APIs are Cloudflare-blocked from cloud IPs.
+      Use JSearch (RAPIDAPI_KEY) for those companies, or Ashby for AI-native companies.
 """
-# Sources count: 22
+# Sources count: 19
 import json, os, re, sys, time, urllib.request, urllib.parse
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -763,6 +762,161 @@ def scrape_lever(roles):
     return jobs
 
 
+# ─── Source 17: Ashby public job boards ──────────────────────────────────────
+
+ASHBY_BOARDS = [
+    # AI/LLM companies
+    "openai", "perplexity", "groq", "together", "modal-labs",
+    "replicate", "character", "elevenlabs", "luma-ai",
+    "cohere", "inflection-ai", "adept", "imbue", "runway",
+    # Dev tools / infra
+    "linear", "arc", "durable",
+    # High-growth tech
+    "supabase", "brex", "scale-ai",
+    # Quant / fintech
+    "jane-street-capital",
+]
+
+def scrape_ashby(roles):
+    print("  [Ashby boards] scraping …")
+    jobs, seen = [], set()
+    for board in ASHBY_BOARDS:
+        raw = fetch(
+            f"https://api.ashbyhq.com/posting-api/job-board/{board}",
+            extra={"Accept": "application/json"},
+        )
+        if not raw:
+            continue
+        try:
+            data = json.loads(raw)
+        except Exception:
+            continue
+        org = data.get("organization", {})
+        org_name = org.get("name", board.replace("-", " ").title()) if isinstance(org, dict) else board.title()
+        for j in data.get("jobs", []):
+            if not j.get("isListed", True):
+                continue
+            title = j.get("title", "")
+            desc_plain = j.get("descriptionPlain", "") or clean(j.get("descriptionHtml", ""))
+            if not role_matches(title, desc_plain[:300], roles):
+                continue
+            published = j.get("publishedDate", "")
+            if not is_recent(published, hours=168):
+                continue
+            uid = str(j.get("id", abs(hash(title + board))))
+            if uid in seen:
+                continue
+            seen.add(uid)
+            loc = j.get("location", "") or j.get("locationName", "")
+            if isinstance(loc, dict):
+                loc = loc.get("name", "")
+            if not is_us_location(str(loc)):
+                continue
+            job_url = j.get("jobUrl", f"https://jobs.ashbyhq.com/{board}/{uid}")
+            _mj = make_job(
+                f"ash_{board}_{uid}", title, org_name, str(loc),
+                "Ashby", job_url, published or "Today",
+                desc_plain[:1000],
+                apply_url=j.get("externalLink", job_url),
+            )
+            if _mj:
+                jobs.append(_mj)
+        time.sleep(0.4)
+    print(f"     ✓ {len(jobs)}")
+    return jobs
+
+
+# ─── Source 18: JSearch via RapidAPI (FAANG direct, optional) ────────────────
+# Set RAPIDAPI_KEY env var to enable. Free tier: 200 requests/month.
+# This is the reliable way to get Google/Apple/Microsoft/Meta jobs from a server.
+
+def scrape_jsearch(roles):
+    api_key = os.environ.get("RAPIDAPI_KEY", "")
+    if not api_key:
+        return []
+    print("  [JSearch/RapidAPI] scraping …")
+    jobs, seen = [], set()
+    HEADERS = {
+        "X-RapidAPI-Key":  api_key,
+        "X-RapidAPI-Host": "jsearch.p.rapidapi.com",
+        "Accept":          "application/json",
+    }
+    FAANG_MAP = {
+        "google": "Google Jobs", "apple": "Apple Jobs",
+        "microsoft": "Microsoft Jobs", "meta": "Meta Jobs",
+        "netflix": "Netflix Jobs", "amazon": "Amazon Jobs",
+    }
+    # Build queries: role-only + role+company for each FAANG
+    queries = []
+    for role in roles[:3]:
+        queries.append(role + " in United States")
+    for company in ["Google", "Apple", "Microsoft", "Meta"]:
+        for role in roles[:2]:
+            queries.append(f"{company} {role} United States")
+
+    for query in queries[:10]:
+        q   = urllib.parse.quote(query)
+        raw = fetch(
+            f"https://jsearch.p.rapidapi.com/search?query={q}&page=1&num_pages=1&date_posted=week",
+            extra=HEADERS, timeout=22,
+        )
+        if not raw:
+            time.sleep(1.2)
+            continue
+        try:
+            data = json.loads(raw)
+        except Exception:
+            time.sleep(1.2)
+            continue
+        for j in (data.get("data") or []):
+            title = j.get("job_title", "")
+            desc  = j.get("job_description", "")
+            if not role_matches(title, desc[:300], roles):
+                continue
+            uid = str(j.get("job_id", abs(hash(title + j.get("employer_name", "")))))
+            if uid in seen:
+                continue
+            seen.add(uid)
+            country = (j.get("job_country") or "").upper()
+            if country and country not in ("US", "USA", "UNITED STATES", ""):
+                continue
+            city  = j.get("job_city", "")
+            state = j.get("job_state", "")
+            if j.get("job_is_remote"):
+                loc = "Remote"
+            elif city or state:
+                loc = f"{city}, {state}".strip(", ")
+            else:
+                loc = "USA"
+            if not is_us_location(loc) and country not in ("US", "USA"):
+                continue
+            posted = j.get("job_posted_at_datetime_utc", "Today")
+            if not is_recent(posted, hours=168):
+                continue
+            apply_url = j.get("job_apply_link", "") or j.get("job_google_link", "")
+            mn, mx = j.get("job_min_salary"), j.get("job_max_salary")
+            try:
+                salary = f"${int(mn):,}–${int(mx):,}" if mn and mx else ""
+            except Exception:
+                salary = ""
+            company_name = j.get("employer_name", "Unknown")
+            cn_lower = company_name.lower()
+            source_label = next(
+                (v for k, v in FAANG_MAP.items() if k in cn_lower), "JSearch"
+            )
+            _mj = make_job(
+                f"js_{uid}", title, company_name, loc,
+                source_label, apply_url,
+                posted, clean(desc)[:1500],
+                salary=salary, apply_url=apply_url,
+            )
+            if _mj:
+                jobs.append(_mj)
+        time.sleep(1.5)
+    print(f"     ✓ {len(jobs)}")
+    return jobs
+
+
 # ─── Source 12: Remotive API ─────────────────────────────────────────────────
 
 def scrape_remotive(roles):
@@ -899,7 +1053,7 @@ def scrape_usajobs(roles):
     return jobs
 
 
-# ─── Source 16: Google Jobs (direct careers API) ─────────────────────────────
+# ─── Legacy: Google Jobs direct (Cloudflare-blocked from cloud IPs, not used) ──
 
 def scrape_google_jobs(roles):
     print("  [Google Jobs] scraping …")
@@ -995,7 +1149,7 @@ def scrape_google_jobs(roles):
     return jobs
 
 
-# ─── Source 17: Amazon Jobs (direct API) ─────────────────────────────────────
+# ─── Source 16: Amazon Jobs (direct API) ─────────────────────────────────────
 
 def scrape_amazon_jobs(roles):
     print("  [Amazon Jobs] scraping …")
@@ -1050,7 +1204,7 @@ def scrape_amazon_jobs(roles):
     return jobs
 
 
-# ─── Source 18: Apple Jobs (direct API) ──────────────────────────────────────
+# ─── Legacy: Apple Jobs direct (Cloudflare-blocked from cloud IPs, not used) ───
 
 def scrape_apple_jobs(roles):
     print("  [Apple Jobs] scraping …")
@@ -1145,7 +1299,7 @@ def scrape_apple_jobs(roles):
     return jobs
 
 
-# ─── Source 19: Microsoft Jobs (direct API) ──────────────────────────────────
+# ─── Legacy: Microsoft Jobs direct (Cloudflare-blocked from cloud IPs, not used) ──
 
 def scrape_microsoft_jobs(roles):
     print("  [Microsoft Jobs] scraping …")
@@ -1218,7 +1372,7 @@ def scrape_microsoft_jobs(roles):
     return jobs
 
 
-# ─── Source 20: Meta Jobs (direct API) ───────────────────────────────────────
+# ─── Legacy: Meta Jobs direct (Cloudflare-blocked from cloud IPs, not used) ────
 
 def scrape_meta_jobs(roles):
     print("  [Meta Jobs] scraping …")
@@ -1352,7 +1506,7 @@ def scrape_meta_jobs(roles):
     return jobs
 
 
-# ─── Source 21: Netflix Jobs (direct API) ────────────────────────────────────
+# ─── Legacy: Netflix Jobs direct (redundant — Netflix is on Lever boards) ───────
 
 def scrape_netflix_jobs(roles):
     print("  [Netflix Jobs] scraping …")
@@ -1404,7 +1558,7 @@ def scrape_netflix_jobs(roles):
     return jobs
 
 
-# ─── Source 22: Apify connector (LinkedIn + Indeed scrapers) ─────────────────
+# ─── Source 19: Apify connector (LinkedIn + Indeed scrapers) ─────────────────
 # Set APIFY_API_TOKEN env var to enable. Uses apify/linkedin-jobs-scraper.
 
 def scrape_apify(roles):
@@ -1534,13 +1688,12 @@ ALL_SCRAPERS = [
     ("Greenhouse",       scrape_greenhouse),
     ("Lever boards",     scrape_lever),
     ("Remotive",         scrape_remotive),
-    # FAANG direct
-    ("Google Jobs",      scrape_google_jobs),
+    # Amazon direct (genuine public API — works from cloud IPs)
     ("Amazon Jobs",      scrape_amazon_jobs),
-    ("Apple Jobs",       scrape_apple_jobs),
-    ("Microsoft Jobs",   scrape_microsoft_jobs),
-    ("Meta Jobs",        scrape_meta_jobs),
-    ("Netflix Jobs",     scrape_netflix_jobs),
+    # Ashby boards — free, no key (OpenAI, Groq, Perplexity, ElevenLabs, …)
+    ("Ashby",            scrape_ashby),
+    # JSearch/RapidAPI — Google/Apple/Microsoft/Meta (only runs if RAPIDAPI_KEY set)
+    ("JSearch",          scrape_jsearch),
     # Apify (only runs if APIFY_API_TOKEN is set)
     ("Apify",            scrape_apify),
 ]
