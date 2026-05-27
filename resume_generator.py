@@ -450,7 +450,7 @@ def render_pdf(profile: dict, output_filename: str) -> str:
     st_body     = S("body",    F,   10, DARK,  TA_LEFT,   0,  2,  13)
     st_sk_lbl   = S("sklbl",   FB,  10, BLACK, TA_LEFT,   0,  2,  12)
     st_sk_val   = S("skval",   F,   10, DARK,  TA_LEFT,   0,  2,  12)
-    st_cc_item  = S("ccitem",  F,    9, DARK,  TA_CENTER, 0,  1,  11)
+    st_cc_item  = S("ccitem",  FB,   9, NAVY,  TA_CENTER, 0,  1,  11)
 
     story = []
 
@@ -556,23 +556,34 @@ def render_pdf(profile: dict, output_filename: str) -> str:
     competencies = [s for s in all_cc if s and str(s).strip()][:15]
     if competencies:
         add_section("Core Competencies")
-        # 3-column grid
-        cols = 3
-        rows = [competencies[i:i+cols] for i in range(0, len(competencies), cols)]
-        col_w = BODY_WIDTH / cols
+        TAG_BG = HexColor("#eef2fb")   # light navy tint for tag cells
+        cols   = 3
+        rows   = [competencies[i:i+cols] for i in range(0, len(competencies), cols)]
+        col_w  = BODY_WIDTH / cols
         for row in rows:
             padded = row + [""] * (cols - len(row))
-            cells  = [Paragraph(f"• {_x(c)}", st_cc_item) if c else Paragraph("", st_cc_item)
-                      for c in padded]
+            cells  = [
+                Paragraph(_x(c), st_cc_item) if c else Paragraph("", st_cc_item)
+                for c in padded
+            ]
             tbl = Table([cells], colWidths=[col_w]*cols, hAlign="LEFT")
-            tbl.setStyle(TableStyle([
+            ts  = [
                 ("VALIGN",        (0,0), (-1,-1), "MIDDLE"),
-                ("LEFTPADDING",   (0,0), (-1,-1), 2),
-                ("RIGHTPADDING",  (0,0), (-1,-1), 2),
-                ("TOPPADDING",    (0,0), (-1,-1), 1),
-                ("BOTTOMPADDING", (0,0), (-1,-1), 1),
-            ]))
+                ("ALIGN",         (0,0), (-1,-1), "CENTER"),
+                ("TOPPADDING",    (0,0), (-1,-1), 4),
+                ("BOTTOMPADDING", (0,0), (-1,-1), 4),
+                ("LEFTPADDING",   (0,0), (-1,-1), 4),
+                ("RIGHTPADDING",  (0,0), (-1,-1), 4),
+            ]
+            for ci, c in enumerate(padded):
+                if c:
+                    ts += [
+                        ("BOX",        (ci,0), (ci,0), 0.5, NAVY),
+                        ("BACKGROUND", (ci,0), (ci,0), TAG_BG),
+                    ]
+            tbl.setStyle(TableStyle(ts))
             story.append(tbl)
+            story.append(Spacer(1, 3))
 
     # ── 4. EXPERIENCE ──────────────────────────────────────────────────────────────
     experience = [e for e in (profile.get("experience") or [])
