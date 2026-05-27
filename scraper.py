@@ -1,18 +1,26 @@
-"""
-TalentFlow Scraper — Maximum Coverage
+"""TalentFlow Scraper — Maximum Coverage + FAANG Direct + H1B Sponsors + Apify
 Sources:
   1. LinkedIn       — public HTML search (multiple queries, pagination)
   2. LinkedIn RSS   — job alert RSS feeds (free, reliable)
-  3. We Work Remotely — official RSS (4 categories)
+  3. We Work Remotely — official RSS (5 categories)
   4. RemoteOK       — free JSON API
   5. Jobright.ai    — JSON-LD structured data
   6. Arbeitnow      — free REST API
   7. Jobicy         — free REST API
   8. HN Who's Hiring — Algolia API
   9. YC Jobs        — public JSON
- 10. Greenhouse API — public board listings
- 11. Lever          — public job board API
+ 10. Greenhouse API — public board listings (incl. H1B sponsors)
+ 11. Lever          — public job board API (incl. H1B sponsors)
  12. Remotive       — free API
+ 13. Otta           — tech jobs API
+ 14. FindWork.dev   — tech jobs API
+ 15. USAJobs.gov    — federal + contract tech jobs
+ 16. Google Jobs    — direct careers.google.com API
+ 17. Amazon Jobs    — direct amazon.jobs API
+ 18. Apple Jobs     — direct jobs.apple.com API
+ 19. Microsoft Jobs — direct careers.microsoft.com API
+ 20. Meta Jobs      — direct metacareers.com API
+ 21. Apify          — LinkedIn/Indeed scraper (APIFY_API_TOKEN env var)
 
 All sources deduplicated, filtered to last 24 hours, role-matched.
 """
@@ -32,7 +40,7 @@ UA_MOBILE    = ("Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
 
 # ─── Utilities ────────────────────────────────────────────────────────────────
 
-def fetch(url, timeout=18, ua=UA_DESKTOP, extra=None, retries=2):
+def fetch(url, timeout=18, ua=UA_DESKTOP, extra=None, retries=2, method="GET", data=None):
     for attempt in range(retries + 1):
         headers = {
             "User-Agent": ua,
@@ -42,7 +50,19 @@ def fetch(url, timeout=18, ua=UA_DESKTOP, extra=None, retries=2):
         }
         if extra:
             headers.update(extra)
-        req = urllib.request.Request(url, headers=headers)
+        body_bytes = None
+        if data is not None:
+            if isinstance(data, (dict, list)):
+                body_bytes = json.dumps(data).encode("utf-8")
+                headers.setdefault("Content-Type", "application/json")
+            elif isinstance(data, str):
+                body_bytes = data.encode("utf-8")
+            elif isinstance(data, bytes):
+                body_bytes = data
+        req = urllib.request.Request(
+            url, headers=headers, data=body_bytes,
+            method=method if (body_bytes is not None or method != "GET") else None
+        )
         try:
             with urllib.request.urlopen(req, timeout=timeout) as r:
                 raw = r.read()
@@ -101,7 +121,6 @@ def detect_platform(url, apply_url=""):
         u = u.lower()
         if "linkedin.com"          in u: return "linkedin"
         if "indeed.com"            in u: return "indeed"
-        # All greenhouse URL variants
         if "greenhouse.io"         in u: return "greenhouse"
         if "boards-api.greenhouse" in u: return "greenhouse"
         if "ghc.greenhouse.io"     in u: return "greenhouse"
@@ -114,10 +133,14 @@ def detect_platform(url, apply_url=""):
         if "icims.com"             in u: return "icims"
         if "bamboohr.com"          in u: return "bamboohr"
         if "taleo.net"             in u: return "manual"
-        # Community/news sites are NOT job application forms
         if "ycombinator.com"       in u: return "manual"
         if "news.ycombinator"      in u: return "manual"
         if "workatastartup.com"    in u: return "manual"
+        if "careers.google.com"    in u: return "greenhouse"
+        if "amazon.jobs"           in u: return "amazon"
+        if "jobs.apple.com"        in u: return "apple"
+        if "careers.microsoft.com" in u: return "microsoft"
+        if "metacareers.com"       in u: return "meta"
     return "manual"
 
 
@@ -133,12 +156,9 @@ def role_matches(title, desc, roles):
     return False
 
 
-# detect_platform MUST be defined before make_job (it is — see above)
-# US state names and common US location keywords for filtering
 US_KEYWORDS = {
     "united states","usa","u.s.a","u.s.","remote","us remote","remote us",
     "anywhere","north america",
-    # States
     "alabama","alaska","arizona","arkansas","california","colorado","connecticut",
     "delaware","florida","georgia","hawaii","idaho","illinois","indiana","iowa",
     "kansas","kentucky","louisiana","maine","maryland","massachusetts","michigan",
@@ -147,26 +167,24 @@ US_KEYWORDS = {
     "north dakota","ohio","oklahoma","oregon","pennsylvania","rhode island",
     "south carolina","south dakota","tennessee","texas","utah","vermont",
     "virginia","washington","west virginia","wisconsin","wyoming",
-    # Abbreviations
     " al "," ak "," az "," ar "," ca "," co "," ct "," de "," fl "," ga ",
     " hi "," id "," il "," in "," ia "," ks "," ky "," la "," me "," md ",
     " ma "," mi "," mn "," ms "," mo "," mt "," ne "," nv "," nh "," nj ",
     " nm "," ny "," nc "," nd "," oh "," ok "," or "," pa "," ri "," sc ",
     " sd "," tn "," tx "," ut "," vt "," va "," wa "," wv "," wi "," wy ",
-    # Major cities
     "new york","los angeles","chicago","houston","phoenix","philadelphia",
     "san antonio","san diego","dallas","san jose","austin","jacksonville",
     "san francisco","columbus","charlotte","seattle","denver","boston",
     "washington dc","nashville","baltimore","memphis","louisville","portland",
     "atlanta","miami","minneapolis","raleigh","richmond","virginia beach",
+    "menlo park","mountain view","sunnyvale","cupertino","redmond","bellevue",
+    "kirkland","palo alto","santa clara","san mateo","new york city","nyc",
 }
 
 def is_us_location(loc: str) -> bool:
-    """Return True if the location is in the US or remote/unspecified."""
     if not loc or not loc.strip():
-        return True   # no location = include (often remote)
+        return True
     l = (" " + loc.lower() + " ")
-    # Explicit non-US regions
     non_us = ["india","uk ","united kingdom","canada","australia","germany",
                "france","spain","italy","netherlands","brazil","mexico",
                "singapore","japan","china","europe","latam","apac","emea",
@@ -180,7 +198,6 @@ def is_us_location(loc: str) -> bool:
     for kw in US_KEYWORDS:
         if kw in l:
             return True
-    # Default include if ambiguous (e.g. "Remote" without country)
     if "remote" in l:
         return True
     return False
@@ -189,7 +206,6 @@ def is_us_location(loc: str) -> bool:
 def make_job(uid, title, company, loc, source, url, posted, desc,
              salary="", tags=None, easy_apply=False, apply_url=None):
     _au = apply_url or url
-    # Detect employment type from title and description
     _emp_text = (title + " " + desc).lower()
     if any(w in _emp_text for w in (
         "contract","contractor","contract-to-hire","c2h","c2c",
@@ -201,7 +217,7 @@ def make_job(uid, title, company, loc, source, url, posted, desc,
     elif any(w in _emp_text for w in ("part-time","part time","parttime","20 hours","20hrs")):
         _emp_type = "Part-time"
     else:
-        _emp_type = "Full-time"  # default assumption
+        _emp_type = "Full-time"
 
     return {
         "id": uid, "title": title.strip(), "company": company.strip(),
@@ -214,7 +230,6 @@ def make_job(uid, title, company, loc, source, url, posted, desc,
         "category": job_category(title),
         "easy_apply": easy_apply,
         "apply_platform": detect_platform(url, _au),
-        # tracking
         "status": "new",
         "ats_score": 0, "match_label": "", "match_reason": "",
         "matched_keywords": [], "missing_keywords": [], "ats_tips": [],
@@ -232,13 +247,13 @@ def rss_field(item, tag):
     return clean(m.group(1)) if m else ""
 
 
-# ─── Source 1: LinkedIn HTML search (multiple pages) ─────────────────────────
+# ─── Source 1: LinkedIn HTML search ──────────────────────────────────────────
 
 def scrape_linkedin_html(roles):
     print("  [LinkedIn HTML] scraping …")
     jobs, seen = [], set()
     for role in roles[:8]:
-        for start in (0, 25, 50):          # 3 pages per role = up to 75 results each
+        for start in (0, 25, 50):
             q    = urllib.parse.quote(role)
             url  = (f"https://www.linkedin.com/jobs/search/"
                     f"?keywords={q}&f_TPR=r86400&sortBy=DD&start={start}")
@@ -258,7 +273,7 @@ def scrape_linkedin_html(roles):
             dates  = re.findall(r'<time[^>]*datetime="([^"]+)"', html)
 
             if not ids:
-                break  # no more pages
+                break
 
             for i, jid in enumerate(ids):
                 if jid in seen: continue
@@ -274,7 +289,7 @@ def scrape_linkedin_html(roles):
                     f"li_{jid}", t, c, l, "LinkedIn", job_url, d,
                     f"{t} at {c}. Open LinkedIn for full description.",
                     tags=[role.title()], easy_apply=False,
-                    apply_url=job_url,   # real apply URL detected at apply time
+                    apply_url=job_url,
                 )
                 if _mj: jobs.append(_mj)
             time.sleep(2.5)
@@ -282,7 +297,7 @@ def scrape_linkedin_html(roles):
     return jobs
 
 
-# ─── Source 2: LinkedIn RSS (public job alert feeds) ─────────────────────────
+# ─── Source 2: LinkedIn RSS ───────────────────────────────────────────────────
 
 def scrape_linkedin_rss(roles):
     print("  [LinkedIn RSS] scraping …")
@@ -300,7 +315,6 @@ def scrape_linkedin_rss(roles):
             if not link or link in seen or not is_recent(pub): continue
             if not role_matches(title, desc, roles): continue
             seen.add(link)
-            # extract job ID from URL if possible
             jid_m = re.search(r"/(\d{8,})", link)
             uid   = f"lirss_{jid_m.group(1)}" if jid_m else f"lirss_{abs(hash(link))}"
             if uid in seen: continue
@@ -546,7 +560,6 @@ def scrape_hn(roles):
             plain = re.sub(r"<[^>]+>"," ",text)
             if not role_matches(role, plain[:400], roles): continue
             first = plain.split("\n")[0].strip()[:55]
-            # Extract any direct apply URL from the HN comment text
             apply_url_match = re.search(
                 r'https?://[^\s<>"]+(?:apply|jobs|careers)[^\s<>"]*',
                 plain[:500], re.IGNORECASE)
@@ -598,7 +611,6 @@ def scrape_yc(roles):
 
 # ─── Source 10: Greenhouse public boards ─────────────────────────────────────
 
-# Greenhouse boards — verified working April 2026
 GREENHOUSE_BOARDS = [
     # Big Tech / Cloud
     "stripe", "anthropic", "airbnb", "databricks", "scaleai",
@@ -615,13 +627,34 @@ GREENHOUSE_BOARDS = [
     "rippling", "gusto", "lattice", "leapsome",
     # Healthcare / Other
     "tempus", "flatiron", "komodohealth", "babylonhealth",
+    # ── H1B Sponsor Tech Unicorns ──────────────────────────────────────────
+    "openai", "snowflake", "palantir", "confluent", "cockroachdb",
+    "rubrik", "toast", "launchdarkly", "hashicorp", "pagerduty",
+    "benchling", "samsara", "block", "square",
+    "pinterest", "snap", "twitter",
+    "servicenow", "splunk", "new-relic", "fastly",
+    "checkr", "gong", "highspot",
+    # ── Financial Services — major H1B sponsors ────────────────────────────
+    "bloomberg", "two-sigma", "citadel", "drw",
+    "jane-street", "optiver", "imc-trading",
+    "point72", "bridgewater", "aqr-capital",
+    # BlackRock / JPMorgan / Goldman use various ATS — try anyway
+    "blackrock-inc", "jpmc", "goldmansachs", "morganstanley",
+    "citi-technology",
+    # ── Automotive / Autonomous Vehicles ──────────────────────────────────
+    "waymo", "cruise", "aurora-innovation", "zoox",
+    # ── Healthcare / Biotech (H1B sponsors) ───────────────────────────────
+    "modernatx", "illumina", "10xgenomics", "grail",
+    "23andme", "guardanthealth", "exactsciences",
+    # ── More consumer/enterprise tech ─────────────────────────────────────
+    "doordash", "instacart", "opendoor",
+    "scale-ai", "labelbox",
 ]
 
 def scrape_greenhouse(roles):
     print("  [Greenhouse boards] scraping …")
     jobs, seen = [], set()
     for board in GREENHOUSE_BOARDS:
-        # Try new API URL first, fall back to classic
         raw = fetch(f"https://boards-api.greenhouse.io/v1/boards/{board}/jobs",
                     extra={"Accept":"application/json"})
         if not raw:
@@ -633,7 +666,6 @@ def scrape_greenhouse(roles):
         for j in data.get("jobs",[]):
             title = j.get("title","")
             if not role_matches(title, "", roles): continue
-            # Greenhouse jobs don't update daily - use 7-day window
             if not is_recent(j.get("updated_at",""), hours=168): continue
             uid = str(j.get("id",""))
             if uid in seen: continue
@@ -655,16 +687,23 @@ def scrape_greenhouse(roles):
 
 # ─── Source 11: Lever public boards ──────────────────────────────────────────
 
-# Lever boards — verified working April 2026
 LEVER_BOARDS = [
     "netflix", "spotify", "notion", "webflow", "rippling",
     "linear", "vercel", "retool", "temporal", "ramp",
     "census", "dagster", "preset", "airbyte",
-    # Additional active Lever boards
     "mixpanel", "amplitude", "segment", "heap",
     "grafana", "honeycomb", "chronosphere", "observe",
     "stytch", "clerk", "auth0", "okta",
     "figma", "miro", "loom", "notion",
+    # ── H1B Sponsor additions ──────────────────────────────────────────────
+    "openai", "scale-ai", "cohere-ai",
+    "waymo", "cruise",
+    "benchling", "osmo",
+    "optiver",
+    "perplexity-ai", "character-ai", "inflection-ai",
+    "replit", "codeium", "cursor",
+    "anduril", "palantir-technologies",
+    "robinhood-markets",
 ]
 
 def scrape_lever(roles):
@@ -679,7 +718,6 @@ def scrape_lever(roles):
         for j in data:
             title = j.get("text","")
             if not role_matches(title, j.get("descriptionPlain","")[:300], roles): continue
-            # Lever createdAt is ms timestamp - use 7-day window for API jobs
             created = j.get("createdAt",0)
             if isinstance(created, (int,float)) and created > 1e9:
                 from datetime import timezone
@@ -744,15 +782,16 @@ def scrape_remotive(roles):
     return jobs
 
 
-# ─── Source 13: Otta (tech jobs, strong data/eng focus) ──────────────────────
+# ─── Source 13: Otta ─────────────────────────────────────────────────────────
 
 def scrape_otta(roles):
     print("  [Otta] scraping …")
     jobs, seen = [], set()
     try:
-        raw = fetch("https://api.otta.com/graphql", method="POST",
-                    body='{"query":"{ jobs(limit:100,offset:0) { id title company { name } location salary { min max currency } url description } }"}',
-                    extra={"Content-Type":"application/json","Accept":"application/json"})
+        raw = fetch("https://api.otta.com/graphql",
+                    extra={"Content-Type":"application/json","Accept":"application/json"},
+                    method="POST",
+                    data='{"query":"{ jobs(limit:100,offset:0) { id title company { name } location salary { min max currency } url description } }"}')
         if raw:
             data = json.loads(raw)
             for j in (data.get("data",{}).get("jobs") or []):
@@ -773,7 +812,7 @@ def scrape_otta(roles):
     return jobs
 
 
-# ─── Source 14: FindWork.dev (tech jobs API, free) ────────────────────────────
+# ─── Source 14: FindWork.dev ─────────────────────────────────────────────────
 
 def scrape_findwork(roles):
     print("  [FindWork] scraping …")
@@ -804,7 +843,7 @@ def scrape_findwork(roles):
     return jobs
 
 
-# ─── Source 15: USAJobs.gov (federal + contract tech jobs) ────────────────────
+# ─── Source 15: USAJobs.gov ───────────────────────────────────────────────────
 
 def scrape_usajobs(roles):
     print("  [USAJobs] scraping …")
@@ -829,8 +868,6 @@ def scrape_usajobs(roles):
                 pay = jd.get("PositionRemuneration",[{}])
                 sal = pay[0].get("MinimumRange","") if pay else ""
                 url = jd.get("ApplyURI",[""])[0] if jd.get("ApplyURI") else jd.get("PositionURI","")
-                # Detect contract from job type
-                schd = " ".join(str(s) for s in jd.get("PositionSchedule",[]))
                 desc = jd.get("UserArea",{}).get("Details",{}).get("JobSummary","")[:1000]
                 _mj = make_job(f"usaj_{uid}", title,
                     jd.get("OrganizationName","US Government"), loc, "USAJobs",
@@ -843,6 +880,428 @@ def scrape_usajobs(roles):
     print(f"     ✓ {len(jobs)}")
     return jobs
 
+
+# ─── Source 16: Google Jobs (direct careers API) ─────────────────────────────
+
+def scrape_google_jobs(roles):
+    print("  [Google Jobs] scraping …")
+    jobs, seen = [], set()
+    for role in roles[:4]:
+        q = urllib.parse.quote(role)
+        url = (f"https://careers.google.com/api/jobs/jobs/"
+               f"?jobs_per_page=20&location=United+States&q={q}"
+               f"&distance=1&jlo=en_US&hl=en")
+        raw = fetch(url, extra={
+            "Accept": "application/json, text/plain, */*",
+            "Referer": "https://careers.google.com/jobs/results/",
+            "Origin": "https://careers.google.com",
+        })
+        if not raw:
+            continue
+        try:
+            data = json.loads(raw)
+        except Exception:
+            continue
+        for j in (data.get("jobs") or []):
+            title = j.get("title", "")
+            if not role_matches(title, j.get("description", "")[:300], roles):
+                continue
+            uid = str(j.get("id", j.get("job_id", "")))
+            if not uid:
+                uid = str(abs(hash(title)))
+            if uid in seen:
+                continue
+            seen.add(uid)
+            locs = j.get("locations", []) or j.get("location", ["United States"])
+            if isinstance(locs, str):
+                locs = [locs]
+            loc = locs[0] if locs else "United States"
+            if not is_us_location(loc):
+                continue
+            posted = j.get("publish_date", j.get("date", "Today"))
+            if not is_recent(posted, hours=168):
+                continue
+            apply_url = j.get("apply_url", j.get("job_url",
+                              f"https://careers.google.com/jobs/results/{uid}"))
+            cats = j.get("categories", j.get("department", []))
+            if isinstance(cats, str):
+                cats = [cats]
+            _mj = make_job(
+                f"goog_{uid}", title, "Google", loc, "Google Jobs",
+                apply_url, posted,
+                clean(j.get("description", ""))[:1500],
+                tags=(cats or [])[:5],
+                apply_url=apply_url,
+            )
+            if _mj:
+                jobs.append(_mj)
+        time.sleep(1.5)
+    print(f"     ✓ {len(jobs)}")
+    return jobs
+
+
+# ─── Source 17: Amazon Jobs (direct API) ─────────────────────────────────────
+
+def scrape_amazon_jobs(roles):
+    print("  [Amazon Jobs] scraping …")
+    jobs, seen = [], set()
+    for role in roles[:4]:
+        q = urllib.parse.quote(role)
+        url = (f"https://www.amazon.jobs/en/search.json"
+               f"?normalized_country_code[]=USA"
+               f"&result_limit=15&sort=relevant&base_query={q}")
+        raw = fetch(url, extra={
+            "Accept": "application/json, text/plain, */*",
+            "Referer": "https://www.amazon.jobs/en/jobs",
+        })
+        if not raw:
+            continue
+        try:
+            data = json.loads(raw)
+        except Exception:
+            continue
+        for j in (data.get("jobs") or []):
+            title = j.get("title", "")
+            desc  = j.get("description", j.get("basic_qualifications", ""))
+            if not role_matches(title, desc[:300], roles):
+                continue
+            uid = str(j.get("id", j.get("job_id", "")))
+            if not uid:
+                uid = str(abs(hash(title)))
+            if uid in seen:
+                continue
+            seen.add(uid)
+            loc = j.get("normalized_location", j.get("location", "USA"))
+            if not is_us_location(loc):
+                continue
+            posted = j.get("posted_date", j.get("updated_time", "Today"))
+            if not is_recent(posted, hours=168):
+                continue
+            url_path = j.get("job_path", "")
+            job_url = (f"https://www.amazon.jobs{url_path}" if url_path
+                       else f"https://www.amazon.jobs/en/jobs/{uid}")
+            cats = j.get("category_friendly", j.get("job_category", ""))
+            _mj = make_job(
+                f"amz_{uid}", title, "Amazon", loc, "Amazon Jobs",
+                job_url, posted,
+                clean(desc)[:1500],
+                tags=[cats][:1] if cats else [],
+                apply_url=job_url,
+            )
+            if _mj:
+                jobs.append(_mj)
+        time.sleep(1.5)
+    print(f"     ✓ {len(jobs)}")
+    return jobs
+
+
+# ─── Source 18: Apple Jobs (direct API) ──────────────────────────────────────
+
+def scrape_apple_jobs(roles):
+    print("  [Apple Jobs] scraping …")
+    jobs, seen = [], set()
+    for role in roles[:4]:
+        q = urllib.parse.quote(role)
+        url = f"https://jobs.apple.com/api/role/search?search={q}&filters=LOC-USA&offset=0&sort=newest"
+        raw = fetch(url, extra={
+            "Accept": "application/json, text/plain, */*",
+            "Referer": "https://jobs.apple.com/en-us/search",
+        })
+        if not raw:
+            continue
+        try:
+            data = json.loads(raw)
+        except Exception:
+            continue
+        for j in (data.get("searchResults") or []):
+            title = j.get("postingTitle", j.get("name", ""))
+            if not role_matches(title, j.get("jobSummary", "")[:300], roles):
+                continue
+            uid = str(j.get("positionId", j.get("id", "")))
+            if not uid:
+                uid = str(abs(hash(title)))
+            if uid in seen:
+                continue
+            seen.add(uid)
+            locs = j.get("locations", [])
+            if isinstance(locs, list) and locs:
+                loc_obj = locs[0]
+                loc = loc_obj.get("name", "USA") if isinstance(loc_obj, dict) else str(loc_obj)
+            else:
+                loc = "USA"
+            if not is_us_location(loc):
+                continue
+            posted = j.get("postDateInGMT", j.get("datePosted", "Today"))
+            if not is_recent(posted, hours=168):
+                continue
+            team = j.get("team", {})
+            team_name = team.get("teamName", "") if isinstance(team, dict) else ""
+            job_url = f"https://jobs.apple.com/en-us/details/{uid}"
+            _mj = make_job(
+                f"appl_{uid}", title, "Apple", loc, "Apple Jobs",
+                job_url, posted,
+                clean(j.get("jobSummary", f"{title} position at Apple."))[:1500],
+                tags=[team_name][:1] if team_name else [],
+                apply_url=job_url,
+            )
+            if _mj:
+                jobs.append(_mj)
+        time.sleep(1.5)
+    print(f"     ✓ {len(jobs)}")
+    return jobs
+
+
+# ─── Source 19: Microsoft Jobs (direct API) ──────────────────────────────────
+
+def scrape_microsoft_jobs(roles):
+    print("  [Microsoft Jobs] scraping …")
+    jobs, seen = [], set()
+    for role in roles[:4]:
+        q = urllib.parse.quote(role)
+        url = (f"https://gcsservices.careers.microsoft.com/search/api/v1/search"
+               f"?q={q}&lc=United+States&l=en_us&pg=1&pgSz=20&o=Relevance&flt=true")
+        raw = fetch(url, extra={
+            "Accept": "application/json",
+            "Referer": "https://careers.microsoft.com/",
+        })
+        if not raw:
+            continue
+        try:
+            data = json.loads(raw)
+        except Exception:
+            continue
+        result = (data.get("operationResult", {})
+                      .get("result", data.get("result", {})))
+        for j in (result.get("jobs") or []):
+            title = j.get("title", "")
+            desc  = j.get("description", j.get("jobSummary", ""))
+            if not role_matches(title, desc[:300], roles):
+                continue
+            uid = str(j.get("jobId", j.get("id", "")))
+            if not uid:
+                uid = str(abs(hash(title)))
+            if uid in seen:
+                continue
+            seen.add(uid)
+            loc = j.get("primaryWorkLocation", j.get("workLocation", "USA"))
+            if not is_us_location(loc):
+                continue
+            posted = j.get("postedDate", j.get("updatedDate", "Today"))
+            if not is_recent(posted, hours=168):
+                continue
+            job_url = f"https://careers.microsoft.com/us/en/job/{uid}"
+            _mj = make_job(
+                f"msft_{uid}", title, "Microsoft", loc, "Microsoft Jobs",
+                job_url, posted,
+                clean(desc)[:1500],
+                apply_url=job_url,
+            )
+            if _mj:
+                jobs.append(_mj)
+        time.sleep(1.5)
+    print(f"     ✓ {len(jobs)}")
+    return jobs
+
+
+# ─── Source 20: Meta Jobs (direct API) ───────────────────────────────────────
+
+def scrape_meta_jobs(roles):
+    print("  [Meta Jobs] scraping …")
+    jobs, seen = [], set()
+    for role in roles[:3]:
+        q = urllib.parse.quote(role)
+        url = f"https://www.metacareers.com/jobs/?q={q}&locations[0]=United+States"
+        html = fetch(url, extra={
+            "Accept": "text/html,application/xhtml+xml,*/*;q=0.9",
+            "Referer": "https://www.metacareers.com/",
+        })
+        if not html:
+            continue
+        # Try __NEXT_DATA__ embedded JSON
+        next_m = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, re.DOTALL)
+        if next_m:
+            try:
+                nd = json.loads(next_m.group(1))
+                props    = nd.get("props", {})
+                page_props = props.get("pageProps", {})
+                jobs_list  = (page_props.get("jobs") or
+                              page_props.get("initialData", {}).get("jobs") or [])
+                for j in jobs_list[:30]:
+                    title = j.get("title", j.get("name", ""))
+                    if not role_matches(title, j.get("description", "")[:300], roles):
+                        continue
+                    uid = str(j.get("id", ""))
+                    if not uid:
+                        uid = str(abs(hash(title)))
+                    if uid in seen:
+                        continue
+                    seen.add(uid)
+                    loc_obj = j.get("location", j.get("jobLocation", {}))
+                    if isinstance(loc_obj, dict):
+                        loc = loc_obj.get("city", loc_obj.get("name", "Menlo Park, CA"))
+                    else:
+                        loc = str(loc_obj) if loc_obj else "Menlo Park, CA"
+                    if not is_us_location(loc):
+                        continue
+                    posted = j.get("post_date", j.get("datePosted", "Today"))
+                    if not is_recent(posted, hours=168):
+                        continue
+                    job_url = f"https://www.metacareers.com/jobs/{uid}"
+                    _mj = make_job(
+                        f"meta_{uid}", title, "Meta", loc, "Meta Jobs",
+                        job_url, posted,
+                        clean(j.get("description", ""))[:1500],
+                        apply_url=job_url,
+                    )
+                    if _mj:
+                        jobs.append(_mj)
+            except Exception as e:
+                print(f"    ⚠ Meta JSON parse: {e}")
+        # Fallback: JSON-LD
+        if not jobs:
+            for block in re.findall(r'<script type="application/ld\+json">(.*?)</script>',
+                                    html, re.DOTALL):
+                try:
+                    obj = json.loads(block)
+                    if isinstance(obj, dict) and obj.get("@type") == "JobPosting":
+                        objs = [obj]
+                    elif isinstance(obj, list):
+                        objs = obj
+                    else:
+                        continue
+                    for item in objs:
+                        if not isinstance(item, dict): continue
+                        title = item.get("title", "")
+                        if not role_matches(title, "", roles): continue
+                        uid = str(abs(hash(title + item.get("datePosted", ""))))
+                        if uid in seen: continue
+                        seen.add(uid)
+                        job_url = item.get("url", "https://www.metacareers.com/jobs")
+                        _mj = make_job(
+                            f"meta_{uid}", title, "Meta", "Menlo Park, CA",
+                            "Meta Jobs", job_url,
+                            item.get("datePosted", "Today"),
+                            clean(item.get("description", ""))[:1500],
+                            apply_url=job_url,
+                        )
+                        if _mj: jobs.append(_mj)
+                except Exception:
+                    pass
+        time.sleep(2.0)
+    print(f"     ✓ {len(jobs)}")
+    return jobs
+
+
+# ─── Source 21: Apify connector (LinkedIn + Indeed scrapers) ─────────────────
+# Set APIFY_API_TOKEN env var to enable. Uses apify/linkedin-jobs-scraper.
+
+def scrape_apify(roles):
+    api_token = os.environ.get("APIFY_API_TOKEN", "")
+    if not api_token:
+        return []
+    print("  [Apify] scraping …")
+    jobs, seen = [], set()
+
+    # LinkedIn jobs scraper via Apify
+    actor_id = "bebity~linkedin-jobs-scraper"
+    for role in roles[:3]:
+        try:
+            url = (f"https://api.apify.com/v2/acts/{actor_id}/"
+                   f"run-sync-get-dataset-items"
+                   f"?token={api_token}&timeout=90&memory=256")
+            raw = fetch(url, method="POST", data={
+                "keywords": role,
+                "location": "United States",
+                "datePosted": "past24Hours",
+                "contractType": "fullTime",
+                "maxResults": 30,
+            }, extra={"Content-Type": "application/json"}, timeout=95)
+            if not raw:
+                continue
+            data_list = json.loads(raw)
+            if not isinstance(data_list, list):
+                continue
+            for j in data_list:
+                title = j.get("position", j.get("title", ""))
+                if not role_matches(title, j.get("description", "")[:300], roles):
+                    continue
+                job_url = j.get("jobUrl", j.get("url", ""))
+                uid = str(j.get("id", abs(hash(job_url or title))))
+                if uid in seen:
+                    continue
+                seen.add(uid)
+                loc = j.get("location", "")
+                if not is_us_location(loc):
+                    continue
+                posted = j.get("postedAt", j.get("publishedAt",
+                               j.get("datePosted", "Today")))
+                if not is_recent(posted):
+                    continue
+                company = j.get("companyName", j.get("company", "Unknown"))
+                desc = (j.get("description") or
+                        j.get("descriptionHtml") or
+                        j.get("jobDescription", ""))
+                _mj = make_job(
+                    f"apify_li_{uid}", title, company, loc,
+                    "Apify/LinkedIn", job_url, posted,
+                    clean(desc)[:1500],
+                    apply_url=j.get("applyUrl", job_url),
+                    easy_apply=bool(j.get("easyApply")),
+                )
+                if _mj:
+                    jobs.append(_mj)
+        except Exception as e:
+            print(f"    ⚠ Apify LinkedIn: {e}")
+        time.sleep(2.0)
+
+    # Indeed scraper via Apify (fallback)
+    if len(jobs) < 10:
+        indeed_actor = "misceres~indeed-scraper"
+        for role in roles[:2]:
+            try:
+                url = (f"https://api.apify.com/v2/acts/{indeed_actor}/"
+                       f"run-sync-get-dataset-items"
+                       f"?token={api_token}&timeout=90&memory=256")
+                raw = fetch(url, method="POST", data={
+                    "position": role,
+                    "country": "US",
+                    "location": "United States",
+                    "maxItems": 20,
+                }, extra={"Content-Type": "application/json"}, timeout=95)
+                if not raw:
+                    continue
+                data_list = json.loads(raw)
+                if not isinstance(data_list, list):
+                    continue
+                for j in data_list:
+                    title = j.get("positionName", j.get("title", ""))
+                    if not role_matches(title, j.get("description", "")[:300], roles):
+                        continue
+                    job_url = j.get("url", j.get("jobUrl", ""))
+                    uid = str(j.get("id", abs(hash(job_url or title))))
+                    if uid in seen:
+                        continue
+                    seen.add(uid)
+                    loc = j.get("location", "")
+                    if not is_us_location(loc):
+                        continue
+                    company = j.get("company", j.get("companyName", "Unknown"))
+                    desc = j.get("description", "")[:1500]
+                    posted = j.get("postedAt", j.get("datePosted", "Today"))
+                    _mj = make_job(
+                        f"apify_ind_{uid}", title, company, loc,
+                        "Apify/Indeed", job_url, posted,
+                        clean(desc),
+                        apply_url=j.get("externalApplyLink", job_url),
+                    )
+                    if _mj:
+                        jobs.append(_mj)
+            except Exception as e:
+                print(f"    ⚠ Apify Indeed: {e}")
+            time.sleep(2.0)
+
+    print(f"     ✓ {len(jobs)}")
+    return jobs
 
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
@@ -863,6 +1322,14 @@ ALL_SCRAPERS = [
     ("Greenhouse",       scrape_greenhouse),
     ("Lever boards",     scrape_lever),
     ("Remotive",         scrape_remotive),
+    # FAANG direct
+    ("Google Jobs",      scrape_google_jobs),
+    ("Amazon Jobs",      scrape_amazon_jobs),
+    ("Apple Jobs",       scrape_apple_jobs),
+    ("Microsoft Jobs",   scrape_microsoft_jobs),
+    ("Meta Jobs",        scrape_meta_jobs),
+    # Apify (only runs if APIFY_API_TOKEN is set)
+    ("Apify",            scrape_apify),
 ]
 
 
@@ -873,14 +1340,13 @@ def run(roles: list[str], work_pref: str = "Any",
     progress_cb(source_name, count_so_far) is called after each source.
     Returns list of new job dicts (already deduplicated).
     """
-    print(f"\n🔍  Scraping {len(ALL_SCRAPERS)} sources | roles: {roles} | type: {emp_type} | work: {work_pref} | last {WINDOW_HOURS}h\n")
+    print(f"\n\U0001f50d  Scraping {len(ALL_SCRAPERS)} sources | roles: {roles} | type: {emp_type} | work: {work_pref} | last {WINDOW_HOURS}h\n")
     t0 = time.time()
 
     all_jobs = []
     for name, fn in ALL_SCRAPERS:
         try:
             batch = fn(roles)
-            # Filter to US locations only
             us_batch = [j for j in batch if is_us_location(j.get("location",""))]
             filtered_out = len(batch) - len(us_batch)
             if filtered_out > 0:
@@ -893,16 +1359,13 @@ def run(roles: list[str], work_pref: str = "Any",
             except Exception: pass
         time.sleep(0.3)
 
-    # Drop None entries (non-US jobs filtered by make_job)
     all_jobs = [j for j in all_jobs if j is not None]
 
-    # Work-preference filter (Remote / Hybrid / On-site)
     if work_pref.lower() not in ("any","all",""):
         wt = work_pref.capitalize()
         filtered = [j for j in all_jobs if j.get("work_type") == wt]
         if filtered: all_jobs = filtered
 
-    # Employment-type filter (Full-time / Contract / Any)
     if emp_type and emp_type.lower() not in ("any","all",""):
         et = emp_type.strip().title()
         type_filtered = [j for j in all_jobs if j.get("employment_type","Full-time") == et]
@@ -910,7 +1373,6 @@ def run(roles: list[str], work_pref: str = "Any",
             all_jobs = type_filtered
             print(f"     Employment filter '{et}': {len(all_jobs)} jobs")
 
-    # Deduplicate by (norm-title, norm-company)
     seen_k, unique = set(), []
     for j in all_jobs:
         k = (re.sub(r"\W+","",j["title"].lower())[:35],
