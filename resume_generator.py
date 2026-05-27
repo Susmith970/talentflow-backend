@@ -529,7 +529,7 @@ def render_pdf(profile: dict, output_filename: str) -> str:
         story.append(tbl)
 
     def add_bullet(text: str):
-        clean_b = re.sub(r"^[*\-- - *]\s*", "", str(text or "").strip())
+        clean_b = re.sub(r"^[-*\s]+", "", str(text or "").strip())
         if clean_b:
             # Wrap in KeepTogether only if very short  -  avoids orphan bullets
             story.append(Paragraph(f"&#x2022;&nbsp; {_x(clean_b)}", st_bullet))
