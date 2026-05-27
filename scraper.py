@@ -20,10 +20,12 @@ Sources:
  18. Apple Jobs     — direct jobs.apple.com API
  19. Microsoft Jobs — direct careers.microsoft.com API
  20. Meta Jobs      — direct metacareers.com API
- 21. Apify          — LinkedIn/Indeed scraper (APIFY_API_TOKEN env var)
+ 21. Netflix Jobs   — direct jobs.netflix.com API
+ 22. Apify          — LinkedIn/Indeed scraper (APIFY_API_TOKEN env var)
 
 All sources deduplicated, filtered to last 24 hours, role-matched.
 """
+# Sources count: 22
 import json, os, re, sys, time, urllib.request, urllib.parse
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -886,23 +888,60 @@ def scrape_usajobs(roles):
 def scrape_google_jobs(roles):
     print("  [Google Jobs] scraping …")
     jobs, seen = [], set()
+    API_URLS = [
+        "https://careers.google.com/api/jobs/jobs/?jobs_per_page=20&location=United+States&q={q}&jlo=en_US&hl=en",
+        "https://careers.google.com/api/jobs/jobs/?jobs_per_page=20&q={q}&hl=en",
+    ]
+    EXTRA = {
+        "Accept": "application/json, text/plain, */*",
+        "Referer": "https://careers.google.com/jobs/results/",
+        "Origin": "https://careers.google.com",
+        "X-Requested-With": "XMLHttpRequest",
+    }
     for role in roles[:4]:
-        q = urllib.parse.quote(role)
-        url = (f"https://careers.google.com/api/jobs/jobs/"
-               f"?jobs_per_page=20&location=United+States&q={q}"
-               f"&distance=1&jlo=en_US&hl=en")
-        raw = fetch(url, extra={
-            "Accept": "application/json, text/plain, */*",
-            "Referer": "https://careers.google.com/jobs/results/",
-            "Origin": "https://careers.google.com",
-        })
-        if not raw:
-            continue
-        try:
-            data = json.loads(raw)
-        except Exception:
-            continue
-        for j in (data.get("jobs") or []):
+        q   = urllib.parse.quote(role)
+        raw = ""
+        for url_tpl in API_URLS:
+            raw = fetch(url_tpl.format(q=q), extra=EXTRA)
+            if raw and raw.strip().startswith("{"):
+                break
+            raw = ""
+            time.sleep(0.8)
+
+        parsed_jobs = []
+        if raw:
+            try:
+                data = json.loads(raw)
+                parsed_jobs = data.get("jobs") or []
+            except Exception:
+                pass
+
+        # HTML fallback — parse JSON-LD from careers page
+        if not parsed_jobs:
+            html = fetch(
+                f"https://careers.google.com/jobs/results/?jobs_per_page=20&q={q}&location=United+States&hl=en",
+                extra={"Accept": "text/html,application/xhtml+xml,*/*;q=0.9", "Referer": "https://careers.google.com/"}
+            )
+            if html:
+                for block in re.findall(r'<script[^>]*type=["\']application/ld\+json["\'][^>]*>(.*?)</script>', html, re.DOTALL):
+                    try:
+                        obj = json.loads(block)
+                        items = obj if isinstance(obj, list) else [obj]
+                        for item in items:
+                            if isinstance(item, dict) and item.get("@type") == "JobPosting":
+                                parsed_jobs.append({
+                                    "title": item.get("title", ""),
+                                    "description": item.get("description", ""),
+                                    "id": str(abs(hash(item.get("title","") + item.get("datePosted","")))),
+                                    "locations": [item.get("jobLocation", {}).get("address", {}).get("addressLocality", "United States")] if isinstance(item.get("jobLocation"), dict) else ["United States"],
+                                    "apply_url": item.get("url", "https://careers.google.com/jobs/results/"),
+                                    "publish_date": item.get("datePosted", "Today"),
+                                    "categories": [item.get("occupationalCategory", "")],
+                                })
+                    except Exception:
+                        pass
+
+        for j in parsed_jobs:
             title = j.get("title", "")
             if not role_matches(title, j.get("description", "")[:300], roles):
                 continue
@@ -912,13 +951,13 @@ def scrape_google_jobs(roles):
             if uid in seen:
                 continue
             seen.add(uid)
-            locs = j.get("locations", []) or j.get("location", ["United States"])
+            locs = j.get("locations", j.get("location", ["United States"]))
             if isinstance(locs, str):
                 locs = [locs]
             loc = locs[0] if locs else "United States"
             if not is_us_location(loc):
                 continue
-            posted = j.get("publish_date", j.get("date", "Today"))
+            posted = j.get("publish_date", j.get("datePosted", j.get("date", "Today")))
             if not is_recent(posted, hours=168):
                 continue
             apply_url = j.get("apply_url", j.get("job_url",
@@ -1002,20 +1041,59 @@ def scrape_apple_jobs(roles):
     jobs, seen = [], set()
     for role in roles[:4]:
         q = urllib.parse.quote(role)
-        url = f"https://jobs.apple.com/api/role/search?search={q}&filters=LOC-USA&offset=0&sort=newest"
-        raw = fetch(url, extra={
-            "Accept": "application/json, text/plain, */*",
+        # Try multiple API param formats
+        API_VARIANTS = [
+            f"https://jobs.apple.com/api/role/search?search={q}&filters=LOC-USA&offset=0&sort=newest&limit=20",
+            f"https://jobs.apple.com/api/role/search?search={q}&offset=0&sort=newest&limit=20",
+            f"https://jobs.apple.com/en-us/search?search={q}&sort=newest&location=united-states-USA",
+        ]
+        EXTRA = {
+            "Accept": "application/json, text/javascript, */*; q=0.01",
             "Referer": "https://jobs.apple.com/en-us/search",
-        })
-        if not raw:
-            continue
-        try:
-            data = json.loads(raw)
-        except Exception:
-            continue
-        for j in (data.get("searchResults") or []):
-            title = j.get("postingTitle", j.get("name", ""))
-            if not role_matches(title, j.get("jobSummary", "")[:300], roles):
+            "X-Apple-Widget-Key": "af1139274f7b4cfdb1de68b2f604c6ed",
+        }
+        search_results = []
+        for api_url in API_VARIANTS:
+            raw = fetch(api_url, extra=EXTRA)
+            if not raw:
+                continue
+            try:
+                data = json.loads(raw)
+                results = data.get("searchResults") or data.get("results") or []
+                if results:
+                    search_results = results
+                    break
+            except Exception:
+                pass
+
+        # HTML fallback
+        if not search_results:
+            html = fetch(
+                f"https://jobs.apple.com/en-us/search?search={q}&sort=newest",
+                extra={"Accept": "text/html,application/xhtml+xml,*/*;q=0.9"}
+            )
+            if html:
+                for block in re.findall(r'<script[^>]*type=["\']application/ld\+json["\'][^>]*>(.*?)</script>', html, re.DOTALL):
+                    try:
+                        obj = json.loads(block)
+                        items = obj if isinstance(obj, list) else [obj]
+                        for item in items:
+                            if isinstance(item, dict) and item.get("@type") == "JobPosting":
+                                uid = str(abs(hash(item.get("title","") + item.get("datePosted",""))))
+                                search_results.append({
+                                    "positionId": uid,
+                                    "postingTitle": item.get("title", ""),
+                                    "jobSummary": item.get("description", ""),
+                                    "postDateInGMT": item.get("datePosted", "Today"),
+                                    "locations": [{"name": "USA"}],
+                                    "_url": item.get("url", f"https://jobs.apple.com/en-us/details/{uid}"),
+                                })
+                    except Exception:
+                        pass
+
+        for j in search_results:
+            title = j.get("postingTitle", j.get("name", j.get("title", "")))
+            if not role_matches(title, j.get("jobSummary", j.get("description", ""))[:300], roles):
                 continue
             uid = str(j.get("positionId", j.get("id", "")))
             if not uid:
@@ -1031,16 +1109,16 @@ def scrape_apple_jobs(roles):
                 loc = "USA"
             if not is_us_location(loc):
                 continue
-            posted = j.get("postDateInGMT", j.get("datePosted", "Today"))
+            posted = j.get("postDateInGMT", j.get("datePosted", j.get("date", "Today")))
             if not is_recent(posted, hours=168):
                 continue
             team = j.get("team", {})
             team_name = team.get("teamName", "") if isinstance(team, dict) else ""
-            job_url = f"https://jobs.apple.com/en-us/details/{uid}"
+            job_url = j.get("_url", f"https://jobs.apple.com/en-us/details/{uid}")
             _mj = make_job(
                 f"appl_{uid}", title, "Apple", loc, "Apple Jobs",
                 job_url, posted,
-                clean(j.get("jobSummary", f"{title} position at Apple."))[:1500],
+                clean(j.get("jobSummary", j.get("description", f"{title} position at Apple.")))[:1500],
                 tags=[team_name][:1] if team_name else [],
                 apply_url=job_url,
             )
@@ -1058,35 +1136,56 @@ def scrape_microsoft_jobs(roles):
     jobs, seen = [], set()
     for role in roles[:4]:
         q = urllib.parse.quote(role)
-        url = (f"https://gcsservices.careers.microsoft.com/search/api/v1/search"
-               f"?q={q}&lc=United+States&l=en_us&pg=1&pgSz=20&o=Relevance&flt=true")
-        raw = fetch(url, extra={
-            "Accept": "application/json",
+        # Try new URL first, fall back to old
+        API_VARIANTS = [
+            f"https://jobs.careers.microsoft.com/global/en/search?q={q}&lc=United+States&l=en_us&pg=1&pgSz=20&o=Relevance&flt=true",
+            f"https://gcsservices.careers.microsoft.com/search/api/v1/search?q={q}&lc=United+States&l=en_us&pg=1&pgSz=20&o=Relevance&flt=true",
+        ]
+        EXTRA = {
+            "Accept": "application/json, text/plain, */*",
             "Referer": "https://careers.microsoft.com/",
-        })
+            "Origin": "https://careers.microsoft.com",
+        }
+        raw = ""
+        for api_url in API_VARIANTS:
+            raw = fetch(api_url, extra=EXTRA)
+            if raw and raw.strip().startswith("{"):
+                break
+            raw = ""
+            time.sleep(0.8)
+
         if not raw:
+            time.sleep(1.5)
             continue
         try:
             data = json.loads(raw)
         except Exception:
+            time.sleep(1.5)
             continue
-        result = (data.get("operationResult", {})
-                      .get("result", data.get("result", {})))
-        for j in (result.get("jobs") or []):
-            title = j.get("title", "")
-            desc  = j.get("description", j.get("jobSummary", ""))
+
+        # Handle both old and new response structures
+        result = (
+            data.get("operationResult", {}).get("result", {})
+            or data.get("result", {})
+            or data
+        )
+        job_list = result.get("jobs") or result.get("value") or []
+
+        for j in job_list:
+            title = j.get("title", j.get("Title", ""))
+            desc  = j.get("description", j.get("jobSummary", j.get("Description", "")))
             if not role_matches(title, desc[:300], roles):
                 continue
-            uid = str(j.get("jobId", j.get("id", "")))
+            uid = str(j.get("jobId", j.get("JobId", j.get("id", ""))))
             if not uid:
                 uid = str(abs(hash(title)))
             if uid in seen:
                 continue
             seen.add(uid)
-            loc = j.get("primaryWorkLocation", j.get("workLocation", "USA"))
+            loc = j.get("primaryWorkLocation", j.get("workLocation", j.get("PrimaryWorkLocation", "USA")))
             if not is_us_location(loc):
                 continue
-            posted = j.get("postedDate", j.get("updatedDate", "Today"))
+            posted = j.get("postedDate", j.get("PostedDate", j.get("updatedDate", "Today")))
             if not is_recent(posted, hours=168):
                 continue
             job_url = f"https://careers.microsoft.com/us/en/job/{uid}"
