@@ -1,18 +1,19 @@
 """
 resume_generator.py
 ===================
-Clean, simple, production-grade resume generation.
+Clean, production-grade resume generation with FAANG-optimized ATS tailoring.
 
 How it works:
 1. Profile data is collected via the UI (no PDF parsing during generation)
-2. Claude tailors the content to match the JD
-3. A deterministic PDF renderer produces a clean, ATS-friendly resume
+2. Two-pass Claude tailoring: deep JD analysis → full rewrite
+3. Deterministic PDF renderer produces a clean, ATS-friendly resume
 
 PDF Template (Jake's Resume — industry standard for engineers):
-  - Name centered, large, bold
+  - Name centered, large, bold, dark navy
   - Contact line centered, pipe-separated
-  - Full-width rule
-  - Section: ALL CAPS bold + underline
+  - Full-width rule (navy)
+  - Core Competencies keyword grid (ATS boost)
+  - Section: ALL CAPS bold + navy underline rule
   - Experience: bold title LEFT | bold company RIGHT, italic loc+dates below
   - Bullets: hanging indent, • character
   - Skills: bold category label + values on same line
@@ -26,21 +27,17 @@ import re
 from datetime import datetime
 from pathlib import Path
 
-# Use DATA_DIR env var (set in Railway) so paths match app.py
 import os as _os
 _data_env = _os.environ.get("DATA_DIR", "")
 if _data_env:
     DATA_DIR = Path(_data_env) / "data"
 elif (Path(__file__).parent / "data").exists():
-    DATA_DIR = Path(__file__).parent / "data"        # flat Railway layout
+    DATA_DIR = Path(__file__).parent / "data"
 else:
-    DATA_DIR = Path(__file__).parent.parent / "data" # local nested layout
+    DATA_DIR = Path(__file__).parent.parent / "data"
 RESUMES_DIR = DATA_DIR / "resumes"
 RESUMES_DIR.mkdir(parents=True, exist_ok=True)
 
-# ---------------------------------------------------------------------------
-# ReportLab imports
-# ---------------------------------------------------------------------------
 try:
     from reportlab.lib.pagesizes import letter
     from reportlab.lib.styles    import ParagraphStyle
@@ -79,7 +76,6 @@ def _call_claude(prompt: str, system: str, max_tokens: int = 4096) -> str:
 
 
 def _parse_json_response(text: str) -> dict:
-    """Extract JSON from Claude response, stripping markdown fences."""
     text = re.sub(r"```(?:json)?\s*", "", text).strip().rstrip("`").strip()
     try:
         return json.loads(text)
@@ -93,11 +89,7 @@ def _parse_json_response(text: str) -> dict:
     return {}
 
 
-# ---------------------------------------------------------------------------
-# XML escaping for ReportLab
-# ---------------------------------------------------------------------------
 def _x(value) -> str:
-    """Escape a value for use inside a ReportLab Paragraph."""
     return (
         str(value or "")
         .replace("&", "&amp;")
@@ -108,35 +100,28 @@ def _x(value) -> str:
 
 
 # ---------------------------------------------------------------------------
-# JD Analysis — Pass 1: extract exactly what the job needs
+# JD Analysis — Pass 1
 # ---------------------------------------------------------------------------
 def _analyze_jd(job_title: str, company: str, jd: str) -> dict:
-    """
-    First pass: deeply analyse the JD and extract a structured targeting document.
-    Returns dict with required_skills, preferred_skills, responsibilities,
-    key_verbs, domain, seniority, and missing_from_generic_resume fields.
-    """
     if not jd.strip():
         return {}
-
     raw = _call_claude(
         prompt=(
             f"Analyse this job description for: {job_title} at {company}\n\n"
             f"JD:\n{jd[:4000]}\n\n"
             f"Extract EVERYTHING the resume must address. Return JSON only:\n"
-            f"{{"
-            f'"domain": "e.g. Data Analytics / Data Engineering / ML Engineering",'
-            f'"seniority": "e.g. Senior / Staff / Lead",'
-            f'"required_skills": ["every skill explicitly marked required"],'
-            f'"preferred_skills": ["skills marked preferred/nice-to-have"],'
-            f'"key_responsibilities": ["top 5 things this person will actually do daily"],'
-            f'"exact_keywords": ["every technical term, tool, framework, methodology mentioned"],'
-            f'"action_verbs_used": ["verbs the JD uses: analyze, build, lead, etc"],'
-            f'"metrics_mentioned": ["any numbers/scale: 100M users, petabyte scale, <100ms latency"],'
-            f'"soft_skills": ["collaboration, communication, etc if mentioned"],'
-            f'"industry_terms": ["domain-specific jargon to include"],'
-            f'"deal_breakers": ["anything marked must-have that could disqualify"],'
-            f'"resume_must_show": ["5 specific things a winning resume for this job must demonstrate"]'
+            f"{{\"domain\": \"e.g. Data Analytics / ML Engineering\","
+            f"\"seniority\": \"e.g. Senior / Staff / Lead\","
+            f"\"required_skills\": [\"every required skill\"],"
+            f"\"preferred_skills\": [\"preferred/nice-to-have skills\"],"
+            f"\"key_responsibilities\": [\"top 5 daily responsibilities\"],"
+            f"\"exact_keywords\": [\"every technical term, tool, framework, methodology\"],"
+            f"\"action_verbs_used\": [\"verbs from JD: analyze, build, lead, etc\"],"
+            f"\"metrics_mentioned\": [\"numbers: 100M users, petabyte scale, <100ms latency\"],"
+            f"\"soft_skills\": [\"collaboration, communication, etc\"],"
+            f"\"industry_terms\": [\"domain-specific jargon\"],"
+            f"\"deal_breakers\": [\"must-have requirements\"],"
+            f"\"resume_must_show\": [\"5 things a winning resume for this role must demonstrate\"]"
             f"}}"
         ),
         system="Return ONLY valid JSON. Be exhaustive — miss nothing from the JD.",
@@ -146,10 +131,9 @@ def _analyze_jd(job_title: str, company: str, jd: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# ATS scoring — scored against the tailored resume content
+# ATS scoring
 # ---------------------------------------------------------------------------
 def ats_score_job(profile: dict, job: dict) -> dict:
-    """Score the tailored resume against the JD. Runs AFTER tailoring."""
     if not os.environ.get("ANTHROPIC_API_KEY"):
         return {
             "ats_score": 0, "match_label": "Unscored",
@@ -157,7 +141,6 @@ def ats_score_job(profile: dict, job: dict) -> dict:
             "missing_keywords": [], "ats_tips": [],
         }
 
-    # Build full resume text — every bullet, skill, summary
     parts = [f"SUMMARY: {profile.get('summary','')}\n"]
     for exp in (profile.get("experience") or [])[:6]:
         parts.append(f"ROLE: {exp.get('title','')} at {exp.get('company','')} ({exp.get('dates','')})")
@@ -173,25 +156,29 @@ def ats_score_job(profile: dict, job: dict) -> dict:
 
     raw = _call_claude(
         prompt=(
-            f"You are a senior recruiter and ATS expert scoring a tailored resume.\n\n"
+            f"You are a senior technical recruiter at a FAANG company and ATS expert scoring a tailored resume.\n\n"
             f"JOB: {job.get('title','')} at {job.get('company','')}\n"
             f"JD: {job.get('description','')[:1500]}\n\n"
             f"RESUME:\n{resume_text}\n\n"
-            f"Score 0-100. Consider:\n"
-            f"- Keyword density: does every major JD term appear in the resume?\n"
-            f"- Bullet relevance: do bullets address what this job actually does?\n"
-            f"- Seniority match: does experience level match the role?\n"
-            f"- ATS parse-ability: clean formatting, no tables/graphics\n\n"
-            f"Be honest. A score of 85+ means a recruiter would definitely interview this person.\n\n"
+            f"Score 0-100 using these weights:\n"
+            f"  Keyword match (40%): Does every major JD technical term appear verbatim?\n"
+            f"  Bullet quality (30%): Are bullets STAR-formatted with quantified outcomes?\n"
+            f"  Seniority alignment (15%): Does experience level match the role?\n"
+            f"  ATS parse-ability (15%): Clean text, no tables breaking content, proper section labels?\n\n"
+            f"FAANG ATS systems (Workday, Taleo, Greenhouse, Lever) specifically weight:\n"
+            f"  - Exact keyword matches (not synonyms) from the JD\n"
+            f"  - Quantified achievements (%, $, scale numbers)\n"
+            f"  - Technical depth (not just listing tools, but describing how they used them)\n\n"
+            f"Be honest. 85+ = recruiter would definitely shortlist.\n\n"
             f"Return JSON only:\n"
             f'{{"ats_score":88,"match_label":"Strong Match",'
             f'"match_reason":"2 specific sentences explaining the score",'
             f'"matched_keywords":["Python","SQL","dbt","Spark"],'
             f'"missing_keywords":["Looker","A/B testing"],'
-            f'"ats_tips":["Add Looker to skills section","Mention A/B testing or experimentation in bullet 3"]}}'
+            f'"ats_tips":["Add Looker to skills","Quantify data pipeline scale in bullet 3","Mirror JD phrase \\"cross-functional\\" in summary"]}}'
         ),
         system="Return ONLY valid JSON. Be precise and honest about the score.",
-        max_tokens=600,
+        max_tokens=700,
     )
     data  = _parse_json_response(raw)
     score = data.get("ats_score", 0)
@@ -207,20 +194,13 @@ def ats_score_job(profile: dict, job: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# AI tailoring — two-pass: analyse JD first, then rewrite with precision
+# AI tailoring — two-pass FAANG-optimized
 # ---------------------------------------------------------------------------
 def tailor_for_job(profile: dict, job_description: str,
                    job_title: str, company: str) -> dict:
-    """
-    Two-pass tailoring:
-    Pass 1 — Deep JD analysis
-    Pass 2 — Rewrite with full creative freedom to write realistic, specific,
-              metrics-driven bullets that sound like a real engineer wrote them.
-    """
     if not os.environ.get("ANTHROPIC_API_KEY") or not job_description.strip():
         return dict(profile)
 
-    # ── Pass 1: Analyse the JD ───────────────────────────────────────────────
     print("  Analysing JD…")
     analysis      = _analyze_jd(job_title, company, job_description) or {}
     required      = analysis.get("required_skills", [])
@@ -233,19 +213,32 @@ def tailor_for_job(profile: dict, job_description: str,
     seniority     = analysis.get("seniority", "")
     industry_terms = analysis.get("industry_terms", [])
 
+    # Detect if this is a FAANG / top-tier company
+    faang_names = {"google", "amazon", "apple", "meta", "microsoft", "netflix",
+                   "facebook", "alphabet", "aws", "azure", "openai", "deepmind",
+                   "blackrock", "goldman", "citadel", "two sigma", "jane street"}
+    is_faang = any(f in company.lower() for f in faang_names)
+    faang_note = (
+        "\nFAANG/TOP-TIER COMPANY NOTE: This company's ATS and recruiters specifically look for:\n"
+        "  - System-scale numbers (DAUs, QPS, petabytes, latency ms, uptime %)\n"
+        "  - Ownership language: \"owned\", \"led\", \"designed\", \"architected\", \"drove\"\n"
+        "  - Cross-functional impact: mention collaboration with PM, design, data science\n"
+        "  - Complexity signals: distributed systems, ML at scale, multi-region, real-time\n"
+        "  - Exact JD phrase mirrors (ATS exact-match scoring)\n"
+    ) if is_faang else ""
+
     targeting = f"""JOB ANALYSIS — {job_title} at {company}
 Domain: {domain} | Seniority: {seniority}
 Required skills: {", ".join(required[:20])}
 Preferred skills: {", ".join(preferred[:15])}
-Exact keywords to use: {", ".join(exact_kw[:30])}
+Exact keywords to use verbatim: {", ".join(exact_kw[:30])}
 Industry terms: {", ".join(industry_terms[:10])}
 Day-to-day responsibilities:
-{chr(10).join(f"  - {r}" for r in responsibilities[:6])}
+{chr(10).join(f'  - {r}' for r in responsibilities[:6])}
 Scale/metrics from JD: {", ".join(metrics[:8])}
 A winning resume must demonstrate:
-{chr(10).join(f"  {i+1}. {m}" for i, m in enumerate(must_show[:6]))}"""
+{chr(10).join(f'  {i+1}. {m}' for i, m in enumerate(must_show[:6]))}{faang_note}"""
 
-    # ── Build content payload ────────────────────────────────────────────────
     yrs = int(profile.get("years_experience", 0) or 0)
     content = {
         "summary": profile.get("summary", ""),
@@ -266,17 +259,19 @@ A winning resume must demonstrate:
         "tools":     profile.get("tools", []),
     }
 
-    # ── Pass 2: Rewrite with full creative freedom ───────────────────────────
     print("  Rewriting resume…")
     raw = _call_claude(
         system=(
             "You are a world-class technical resume writer who gets senior engineers "
-            "hired at top companies. You write authentic, specific, metrics-driven resumes "
-            "that read like a real engineer wrote them — not generic filler. "
-            "Every bullet tells a concrete story: what was the problem, what did they build, "
-            "what was the measurable outcome. Return ONLY valid JSON."
+            "hired at Google, Meta, Amazon, Apple, Microsoft, and top hedge funds. "
+            "You write authentic, specific, metrics-driven resumes that read like a real "
+            "engineer wrote them — not generic filler. "
+            "Every bullet: [Power verb] + [specific technical action] + [JD keyword] + [quantified outcome]. "
+            "STAR format: what was the scale, what did they build, what was the business result. "
+            "ATS optimization: every exact keyword from the JD appears naturally at least once. "
+            "Return ONLY valid JSON."
         ),
-        prompt=f"""You are tailoring {profile.get("name","this candidate")}\'s resume for:
+        prompt=f"""You are tailoring {profile.get("name","this candidate")}’s resume for:
 ROLE: {job_title} at {company}
 
 FULL JOB DESCRIPTION:
@@ -284,52 +279,45 @@ FULL JOB DESCRIPTION:
 
 {targeting}
 
-CANDIDATE\'S CURRENT RESUME:
+CANDIDATE’S CURRENT RESUME:
 {json.dumps(content, indent=2)[:4000]}
 
-════════════════════════════════════════════
+════════════════════════════════════════
 YOUR TASK — REWRITE WITH FULL CREATIVE FREEDOM
-════════════════════════════════════════════
+════════════════════════════════════════
 
 You have FULL CREATIVE FREEDOM to write compelling, realistic bullets.
-Think: what would a top engineer in this exact role actually have done?
-Write bullets that sound like a real senior person wrote them — specific,
-technical, and with real business impact. You can:
 
-✓ Infer realistic scenarios from the candidate\'s tech stack + role
-✓ Write NEW bullets that plausibly describe what someone with their background
-  would have done at that company (e.g. "Led migration of X to Y, reducing Z by N%")
-✓ Add realistic metrics where none exist (use hedged language: "~40%", "over 500K",
-  "reduced from ~8hrs to <30min")
-✓ Connect their AWS experience to Azure JD requirements naturally
-✓ Write the summary from scratch — make it punchy and role-specific
+✓ Infer realistic scenarios from the candidate’s tech stack + role
+✓ Write NEW bullets that plausibly describe what someone with their background would have done
+✓ Add realistic metrics (“~40%”, “over 500K”, “reduced from ~8hrs to <30min”)
+✓ Mirror exact JD phrases — ATS scores exact string matches highly
+✓ Summary: 3-4 punchy sentences, opens with years_experience, mirrors JD language
+✓ Skills section: put required JD skills FIRST, then preferred, then other
 
 RULES — ABSOLUTE CONSTRAINTS:
-• NEVER change company names, job titles, employment dates, school names, or years of experience
-• NEVER invent or rename companies. Output MUST use the exact company names from the input.
-• NEVER change years_experience in the summary. Use the exact number provided.
-• NEVER claim a degree or certification they don\'t have
-• Keep bullets technically accurate to their stack (don\'t invent unrelated tech)
-• Most recent job: 5-6 bullets. Second job: 4-5 bullets. Earlier jobs: 2-3 bullets.
-• Internship / entry-level (title contains "Intern" or "Junior"): MAX 2-3 bullets only.
-• Every bullet: [Power verb] + [specific technical action] + [JD keyword] + [metric]
-• Summary: 3-4 sentences, mirrors JD language, opens with exact years_experience from input data
-• CRITICAL: Return ALL experience entries. If input has 5 jobs, return 5 jobs. Never omit any.
+• NEVER change company names, job titles, employment dates, school names
+• NEVER invent companies. Use exact company names from input.
+• NEVER change years_experience number in summary
+• NEVER claim a degree or certification they don’t have
+• Most recent job: 5-6 bullets. Second job: 4-5. Earlier: 2-3. Internship: max 2-3.
+• Return ALL experience entries — never omit any.
+• Every bullet: [Power verb] + [technical action] + [JD keyword] + [metric/impact]
 
 BULLET FORMULA EXAMPLES:
-• "Engineered a real-time Kafka ingestion layer processing 2M+ events/day,
-  reducing data latency from ~4hrs to under 90 seconds for downstream ML pipelines"
-• "Automated Terraform-based provisioning of EKS clusters, cutting new environment
-  setup from 3 days to ~45 minutes and eliminating 100% of manual config drift"
-• "Built dbt transformation models across 40+ tables, replacing ad-hoc SQL and
-  reducing analyst query time by ~65% while improving data lineage visibility"
+• \"Engineered real-time Kafka ingestion pipeline processing 2M+ events/day, reducing
+  downstream ML feature latency from ~4hrs to under 90 seconds\"
+• \"Architected multi-region EKS deployment with Terraform, cutting environment provisioning
+  from 3 days to ~45 minutes while eliminating 100% of configuration drift\"
+• \"Led migration of 40+ dbt models to Snowflake, reducing analyst query time ~65% and
+  improving data lineage visibility across 12 downstream dashboards\"
 
-Return ONLY this JSON (no markdown, no commentary):
+Return ONLY this JSON:
 {{"summary":"3-4 sentence punchy targeted summary",
-"experience":[{{"title":"UNCHANGED","company":"UNCHANGED","location":"UNCHANGED","dates":"UNCHANGED","bullets":["compelling bullet 1","compelling bullet 2","compelling bullet 3"]}}],
-"projects":[{{"name":"UNCHANGED","technologies":"updated tech stack","bullets":["rewritten project bullet"]}}],
-"skills":["required skills first"],"ml_skills":["relevant ml skills"],"tools":["relevant tools"],
-"keywords_added":["every JD keyword now woven into resume"]}}""",
+"experience":[{{"title":"UNCHANGED","company":"UNCHANGED","location":"UNCHANGED","dates":"UNCHANGED","bullets":["bullet 1","bullet 2"]}}],
+"projects":[{{"name":"UNCHANGED","technologies":"updated stack","bullets":["project bullet"]}}],
+"skills":["JD-required skills first"],"ml_skills":["relevant ml skills"],"tools":["relevant tools"],
+"keywords_added":["every JD keyword woven in"]}}""",
         max_tokens=4096,
     )
 
@@ -339,9 +327,6 @@ Return ONLY this JSON (no markdown, no commentary):
         print("  Warning: tailoring returned bad JSON — using original profile")
         return dict(profile)
 
-    # Merge — lock factual fields, take Claude\'s creative bullets
-    # CRITICAL: iterate orig_exp (not tailored list) so ALL jobs always appear.
-    # Claude sometimes returns fewer jobs than given — that must never drop a job.
     result        = dict(profile)
     orig_exp      = profile.get("experience") or []
     orig_prj      = profile.get("projects") or []
@@ -350,18 +335,15 @@ Return ONLY this JSON (no markdown, no commentary):
     if tailored.get("summary"):
         result["summary"] = tailored["summary"]
 
-    # Build lookup: normalised company name → tailored bullets
     def _norm(s): return re.sub(r"\W+", "", str(s or "").lower())
     tailored_map = {}
     for i, texp in enumerate(tailored_exps):
         key = _norm(texp.get("company", "")) or f"__idx_{i}"
         tailored_map[key] = texp.get("bullets", [])
-        # also index by position
         tailored_map[f"__idx_{i}"] = tailored_map.get(f"__idx_{i}") or texp.get("bullets", [])
 
     safe_exp = []
     for i, orig in enumerate(orig_exp):
-        # Try company-name match first, then positional fallback, then keep original
         key         = _norm(orig.get("company", ""))
         pos_key     = f"__idx_{i}"
         new_bullets = (tailored_map.get(key) or
@@ -397,33 +379,22 @@ Return ONLY this JSON (no markdown, no commentary):
 
 
 # ---------------------------------------------------------------------------
-# PDF renderer — Jake's Resume template
+# PDF renderer — Jake’s Resume template, enhanced with navy accent
 # ---------------------------------------------------------------------------
 def render_pdf(profile: dict, output_filename: str) -> str:
     """
     Render profile data to a formatted, ATS-friendly PDF.
 
     Visual layout:
-        FIRSTNAME LASTNAME                     ← 20pt bold, centered
+        FIRSTNAME LASTNAME                     ← 20pt bold navy, centered
         email | phone | location | linkedin    ← 9pt, centered
-        ─────────────────────────────────      ← 1pt rule
-        EXPERIENCE                             ← 11pt bold + 0.5pt rule
+        ───────────────────────────────── navy rule
+        CORE COMPETENCIES (keyword grid for ATS)
+        EXPERIENCE                             ← 11pt bold navy + rule
         Job Title             Company          ← bold left | bold right
                          Location · Dates      ← italic right
         • Bullet one
-        • Bullet two
-        EDUCATION
-        School Name                  Dates     ← bold left | italic right
-        Degree, GPA, Honors                    ← 10pt normal
-        PROJECTS
-        Name | Tech Stack            Date      ← bold left | italic right
-        • Bullet
-        TECHNICAL SKILLS
-        Languages:   Python, SQL, Go
-        ML / AI:     PyTorch, PySpark
-        Tools:       AWS, Docker, K8s
-        CERTIFICATIONS
-        • AWS Solutions Architect
+        ...
     """
     if not REPORTLAB_AVAILABLE:
         raise RuntimeError("reportlab not installed: pip install reportlab")
@@ -431,10 +402,9 @@ def render_pdf(profile: dict, output_filename: str) -> str:
     RESUMES_DIR.mkdir(parents=True, exist_ok=True)
     output_path = RESUMES_DIR / output_filename
 
-    # ── Page geometry ──────────────────────────────────────────────────────
     PAGE_W, PAGE_H = letter
-    MARGIN         = 0.5 * inch
-    BODY_WIDTH     = PAGE_W - 2 * MARGIN   # 7.5 inches
+    MARGIN     = 0.50 * inch
+    BODY_WIDTH = PAGE_W - 2 * MARGIN
 
     doc = SimpleDocTemplate(
         str(output_path),
@@ -443,135 +413,119 @@ def render_pdf(profile: dict, output_filename: str) -> str:
         topMargin  = MARGIN, bottomMargin = MARGIN,
     )
 
-    # ── Colors ─────────────────────────────────────────────────────────────
+    # Colors
+    NAVY  = HexColor("#1a2744")   # header text + section rules
     BLACK = HexColor("#000000")
     DARK  = HexColor("#111111")
     GRAY  = HexColor("#444444")
-    LIGHT = HexColor("#666666")
-    LINE  = HexColor("#000000")
+    LIGHT = HexColor("#555555")
+    RULE  = HexColor("#1a2744")   # navy rules for sections
 
-    # ── Fonts ──────────────────────────────────────────────────────────────
     F  = "Helvetica"
     FB = "Helvetica-Bold"
     FI = "Helvetica-Oblique"
 
-    # ── Style factory ──────────────────────────────────────────────────────
     def S(name, font=F, size=10, color=DARK,
           align=TA_LEFT, before=0, after=0, leading=None, **kw):
         return ParagraphStyle(
             name,
-            fontName     = font,
-            fontSize     = size,
-            textColor    = color,
-            alignment    = align,
-            spaceBefore  = before,
-            spaceAfter   = after,
-            leading      = leading or round(size * 1.25, 1),
+            fontName    = font,
+            fontSize    = size,
+            textColor   = color,
+            alignment   = align,
+            spaceBefore = before,
+            spaceAfter  = after,
+            leading     = leading or round(size * 1.25, 1),
             **kw,
         )
 
-    # Define every style once, clearly named
-    st_name    = S("name",    FB,  20, BLACK, TA_CENTER, 0,  2,  24)
-    st_contact = S("contact", F,    9, LIGHT, TA_CENTER, 0,  4,  11)
-    st_sec_hd  = S("sechd",   FB,  11, BLACK, TA_LEFT,   6,  1,  13)  # section heading
-    st_job_l   = S("jobl",    FB,  10, BLACK, TA_LEFT,   0,  0,  12)  # left col of job row
-    st_job_r   = S("jobr",    FI,  10, LIGHT, TA_RIGHT,  0,  0,  12)  # right col of job row
-    st_job_sub = S("jobsub",  FI,  10, LIGHT, TA_LEFT,   0,  1,  12)  # degree / subtitle
-    st_bullet  = S("bullet",  F,   10, DARK,  TA_LEFT,   0,  2,  12.5,
-                   leftIndent = 0.18 * inch, firstLineIndent = -0.12 * inch)
-    st_body    = S("body",    F,   10, DARK,  TA_LEFT,   0,  2,  13)
-    st_sk_lbl  = S("sklbl",   FB,  10, BLACK, TA_LEFT,   0,  2,  12)
-    st_sk_val  = S("skval",   F,   10, DARK,  TA_LEFT,   0,  2,  12)
+    st_name     = S("name",    FB,  20, NAVY,  TA_CENTER, 0,  2,  24)
+    st_contact  = S("contact", F,    9, LIGHT, TA_CENTER, 0,  4,  11)
+    st_sec_hd   = S("sechd",   FB,  11, NAVY,  TA_LEFT,   6,  1,  13)
+    st_job_l    = S("jobl",    FB,  10, BLACK, TA_LEFT,   0,  0,  12)
+    st_job_r    = S("jobr",    FI,  10, LIGHT, TA_RIGHT,  0,  0,  12)
+    st_job_sub  = S("jobsub",  FI,  10, LIGHT, TA_LEFT,   0,  1,  12)
+    st_bullet   = S("bullet",  F,   10, DARK,  TA_LEFT,   0,  2,  12.5,
+                    leftIndent=0.18*inch, firstLineIndent=-0.12*inch)
+    st_body     = S("body",    F,   10, DARK,  TA_LEFT,   0,  2,  13)
+    st_sk_lbl   = S("sklbl",   FB,  10, BLACK, TA_LEFT,   0,  2,  12)
+    st_sk_val   = S("skval",   F,   10, DARK,  TA_LEFT,   0,  2,  12)
+    st_cc_item  = S("ccitem",  F,    9, DARK,  TA_CENTER, 0,  1,  11)
 
-    # ── Story builder ──────────────────────────────────────────────────────
     story = []
 
-    def add_rule(thickness=0.6, color=LINE, before=1, after=3):
+    def add_rule(thickness=0.6, color=RULE, before=1, after=3):
         story.append(HRFlowable(
-            width       = "100%",
-            thickness   = thickness,
-            color       = color,
-            spaceBefore = before,
-            spaceAfter  = after,
+            width="100%", thickness=thickness, color=color,
+            spaceBefore=before, spaceAfter=after,
         ))
 
     def add_section(title: str):
         story.append(Spacer(1, 3))
         story.append(Paragraph(title.upper(), st_sec_hd))
-        add_rule(thickness=0.5, before=1, after=3)
+        add_rule(thickness=0.5, color=NAVY, before=1, after=3)
 
-    def add_two_col(left_text: str, right_text: str,
-                    left_style, right_style, left_frac=0.60):
-        """One table row with left and right paragraphs, zero padding."""
-        left_w  = BODY_WIDTH * left_frac
-        right_w = BODY_WIDTH * (1.0 - left_frac)
+    def add_two_col(left_text, right_text, left_style, right_style, left_frac=0.60):
+        lw = BODY_WIDTH * left_frac
+        rw = BODY_WIDTH * (1.0 - left_frac)
         tbl = Table(
-            [[Paragraph(left_text, left_style),
-              Paragraph(right_text, right_style)]],
-            colWidths = [left_w, right_w],
-            hAlign    = "LEFT",
+            [[Paragraph(left_text, left_style), Paragraph(right_text, right_style)]],
+            colWidths=[lw, rw], hAlign="LEFT",
         )
         tbl.setStyle(TableStyle([
-            ("VALIGN",        (0, 0), (-1, -1), "BOTTOM"),
-            ("LEFTPADDING",   (0, 0), (-1, -1), 0),
-            ("RIGHTPADDING",  (0, 0), (-1, -1), 0),
-            ("TOPPADDING",    (0, 0), (-1, -1), 0),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
+            ("VALIGN",        (0,0), (-1,-1), "BOTTOM"),
+            ("LEFTPADDING",   (0,0), (-1,-1), 0),
+            ("RIGHTPADDING",  (0,0), (-1,-1), 0),
+            ("TOPPADDING",    (0,0), (-1,-1), 0),
+            ("BOTTOMPADDING", (0,0), (-1,-1), 0),
         ]))
         story.append(tbl)
 
     def add_bullet(text: str):
-        clean = re.sub(r"^[•\-–—*]\s*", "", str(text or "").strip())
-        if clean:
-            # Use a simple dash bullet — avoids (cid:127) rendering issues in some PDF viewers
-            story.append(Paragraph(f"- &nbsp; {_x(clean)}", st_bullet))
+        clean_b = re.sub(r"^[•\-–—*]\s*", "", str(text or "").strip())
+        if clean_b:
+            story.append(Paragraph(f"• &nbsp;{_x(clean_b)}", st_bullet))
 
     def add_skill_row(label: str, items: list):
-        clean = [str(i).strip() for i in items if str(i).strip()]
-        if not clean:
+        clean_i = [str(i).strip() for i in items if str(i).strip()]
+        if not clean_i:
             return
         tbl = Table(
             [[Paragraph(f"<b>{_x(label)}:</b>", st_sk_lbl),
-              Paragraph(_x(",  ".join(clean)), st_sk_val)]],
-            colWidths = [BODY_WIDTH * 0.22, BODY_WIDTH * 0.78],
-            hAlign    = "LEFT",
+              Paragraph(_x(",  ".join(clean_i)), st_sk_val)]],
+            colWidths=[BODY_WIDTH*0.22, BODY_WIDTH*0.78], hAlign="LEFT",
         )
         tbl.setStyle(TableStyle([
-            ("VALIGN",        (0, 0), (-1, -1), "TOP"),
-            ("LEFTPADDING",   (0, 0), (-1, -1), 0),
-            ("RIGHTPADDING",  (0, 0), (-1, -1), 0),
-            ("TOPPADDING",    (0, 0), (-1, -1), 1),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 1),
+            ("VALIGN",        (0,0), (-1,-1), "TOP"),
+            ("LEFTPADDING",   (0,0), (-1,-1), 0),
+            ("RIGHTPADDING",  (0,0), (-1,-1), 0),
+            ("TOPPADDING",    (0,0), (-1,-1), 1),
+            ("BOTTOMPADDING", (0,0), (-1,-1), 1),
         ]))
         story.append(tbl)
 
-    # ── 1. HEADER ──────────────────────────────────────────────────────────
+    # ── 1. HEADER ────────────────────────────────────────────────────────────────────
     name = (profile.get("name") or "Your Name").strip()
     story.append(Paragraph(_x(name), st_name))
 
-    # Build contact line: email | phone | location | linkedin | github
-    # Filters out deployment URLs (railway, vercel, heroku, render, localhost)
     BAD_HOSTS = ("railway", "vercel", "herokuapp", "render.com", "localhost", "ngrok")
     contact_items = []
     for field in ("email", "phone", "location"):
         val = (profile.get(field) or "").strip()
         if val:
             contact_items.append(val)
-    # LinkedIn
     li = (profile.get("linkedin") or "").strip()
     if li:
         li = li.lstrip("/")
         if "linkedin.com" not in li:
             li = "linkedin.com/in/" + li
         contact_items.append(li)
-    # GitHub
     gh = (profile.get("github") or "").strip()
     if gh:
         gh = gh.lstrip("/")
         if "github.com" not in gh:
             gh = "github.com/" + gh
         contact_items.append(gh)
-    # Personal website — only if it's a real personal site
     for ws_field in ("portfolio_url", "website"):
         ws = (profile.get(ws_field) or "").strip()
         if ws and not any(bad in ws.lower() for bad in BAD_HOSTS):
@@ -584,15 +538,43 @@ def render_pdf(profile: dict, output_filename: str) -> str:
             st_contact,
         ))
 
-    add_rule(thickness=1.0, before=4, after=0)
+    add_rule(thickness=1.2, color=NAVY, before=4, after=0)
 
-    # ── 2. SUMMARY ─────────────────────────────────────────────────────────
+    # ── 2. SUMMARY ───────────────────────────────────────────────────────────────────
     summary = (profile.get("summary") or "").strip()
     if summary:
         add_section("Summary")
         story.append(Paragraph(_x(summary), st_body))
 
-    # ── 3. EXPERIENCE ──────────────────────────────────────────────────────
+    # ── 3. CORE COMPETENCIES (ATS keyword grid) ────────────────────────────────
+    # Pull top skills (JD-matched skills are first after tailoring)
+    all_cc = (
+        list(profile.get("skills", []))[:8] +
+        list(profile.get("ml_skills", []))[:4] +
+        list(profile.get("tools", []))[:4]
+    )
+    competencies = [s for s in all_cc if s and str(s).strip()][:15]
+    if competencies:
+        add_section("Core Competencies")
+        # 3-column grid
+        cols = 3
+        rows = [competencies[i:i+cols] for i in range(0, len(competencies), cols)]
+        col_w = BODY_WIDTH / cols
+        for row in rows:
+            padded = row + [""] * (cols - len(row))
+            cells  = [Paragraph(f"• {_x(c)}", st_cc_item) if c else Paragraph("", st_cc_item)
+                      for c in padded]
+            tbl = Table([cells], colWidths=[col_w]*cols, hAlign="LEFT")
+            tbl.setStyle(TableStyle([
+                ("VALIGN",        (0,0), (-1,-1), "MIDDLE"),
+                ("LEFTPADDING",   (0,0), (-1,-1), 2),
+                ("RIGHTPADDING",  (0,0), (-1,-1), 2),
+                ("TOPPADDING",    (0,0), (-1,-1), 1),
+                ("BOTTOMPADDING", (0,0), (-1,-1), 1),
+            ]))
+            story.append(tbl)
+
+    # ── 4. EXPERIENCE ──────────────────────────────────────────────────────────────
     experience = [e for e in (profile.get("experience") or [])
                   if (e.get("title") or e.get("company"))]
     if experience:
@@ -604,30 +586,20 @@ def render_pdf(profile: dict, output_filename: str) -> str:
             dates   = (exp.get("dates",    "") or "").strip()
             bullets = [b for b in (exp.get("bullets") or []) if str(b).strip()]
 
-            # Row 1: bold title left | bold company right
             add_two_col(
                 f"<b>{_x(title)}</b>",
                 f"<b>{_x(company)}</b>",
-                st_job_l, st_job_r,
-                left_frac=0.60,
+                st_job_l, st_job_r, left_frac=0.60,
             )
-
-            # Row 2: empty left | italic "location  ·  dates" right
             sub_right = "  ·  ".join(p for p in [_x(loc), _x(dates)] if p)
             if sub_right:
-                add_two_col(
-                    "",
-                    sub_right,
-                    st_job_sub, st_job_r,
-                    left_frac=0.60,
-                )
+                add_two_col("", sub_right, st_job_sub, st_job_r, left_frac=0.60)
 
             for b in bullets:
                 add_bullet(b)
-
             story.append(Spacer(1, 6))
 
-    # ── 4. PROJECTS ────────────────────────────────────────────────────────
+    # ── 5. PROJECTS ──────────────────────────────────────────────────────────────────
     projects = [p for p in (profile.get("projects") or []) if p.get("name")]
     if projects:
         add_section("Projects")
@@ -638,21 +610,17 @@ def render_pdf(profile: dict, output_filename: str) -> str:
             url     = (proj.get("url",          "") or "").strip()
             bullets = [b for b in (proj.get("bullets") or []) if str(b).strip()]
 
-            # Row: bold name | tech   dates right
-            left_text  = f"<b>{_x(pname)}</b>"
+            left_text = f"<b>{_x(pname)}</b>"
             if tech:
                 left_text += f"  |  <i>{_x(tech)}</i>"
             add_two_col(left_text, _x(dates), st_job_l, st_job_r, left_frac=0.70)
-
             if url:
                 story.append(Paragraph(f"<i>{_x(url)}</i>", st_job_sub))
-
             for b in bullets:
                 add_bullet(b)
-
             story.append(Spacer(1, 6))
 
-    # ── 5. EDUCATION ───────────────────────────────────────────────────────
+    # ── 6. EDUCATION ────────────────────────────────────────────────────────────────
     education = [e for e in (profile.get("education") or [])
                  if (e.get("degree") or e.get("school"))]
     if education:
@@ -666,16 +634,12 @@ def render_pdf(profile: dict, output_filename: str) -> str:
             honors  = (edu.get("honors",  "") or "").strip()
             courses = (edu.get("relevant_courses", "") or "").strip()
 
-            # Row: bold school left | dates right
             right_parts = [p for p in [_x(loc), _x(dates)] if p]
             add_two_col(
                 f"<b>{_x(school)}</b>",
                 "  ·  ".join(right_parts),
-                st_job_l, st_job_r,
-                left_frac=0.60,
+                st_job_l, st_job_r, left_frac=0.60,
             )
-
-            # Degree + GPA + honors on one line
             sub_parts = [_x(degree)] if degree else []
             if gpa:    sub_parts.append(f"GPA: {_x(gpa)}")
             if honors: sub_parts.append(_x(honors))
@@ -684,18 +648,15 @@ def render_pdf(profile: dict, output_filename: str) -> str:
             if courses:
                 story.append(Paragraph(
                     f"<i>Relevant Coursework:</i>  {_x(courses)}", st_job_sub))
-
             story.append(Spacer(1, 6))
 
-    # ── 6. TECHNICAL SKILLS ────────────────────────────────────────────────
+    # ── 7. TECHNICAL SKILLS ────────────────────────────────────────────────────
     all_skills = list(profile.get("skills",    []))
     ml_skills  = list(profile.get("ml_skills", []))
     tools      = list(profile.get("tools",     []))
 
     if all_skills or ml_skills or tools:
         add_section("Technical Skills")
-
-        # Separate programming languages from frameworks heuristically
         LANG_SET = {
             "python", "sql", "r", "java", "go", "golang", "scala", "kotlin",
             "swift", "typescript", "javascript", "js", "ts", "c", "c++", "c#",
@@ -706,14 +667,13 @@ def render_pdf(profile: dict, output_filename: str) -> str:
         ml_cap = ml_skills[:12]
         tools_cap = tools[:12]
 
-        if langs:     add_skill_row("Languages",   langs)
-        if fworks:    add_skill_row("Frameworks",  fworks)
-        if ml_cap:    add_skill_row("ML / AI",     ml_cap)
-        if tools_cap: add_skill_row("Tools",       tools_cap)
+        if langs:     add_skill_row("Languages",  langs)
+        if fworks:    add_skill_row("Frameworks", fworks)
+        if ml_cap:    add_skill_row("ML / AI",    ml_cap)
+        if tools_cap: add_skill_row("Tools",      tools_cap)
 
-    # ── 7. CERTIFICATIONS ──────────────────────────────────────────────────
+    # ── 8. CERTIFICATIONS ────────────────────────────────────────────────────────
     def _clean_cert(raw: str) -> str:
-        """Convert {'name': 'X', 'issuer': 'Y', 'date': 'Z'} to 'X – Y, Z'."""
         raw = raw.strip()
         if not raw.startswith("{"):
             return raw
@@ -726,15 +686,14 @@ def render_pdf(profile: dict, output_filename: str) -> str:
         if date:   parts.append(date.group(1))
         return ",  ".join(parts) if parts else raw
 
-    certs = [_clean_cert(str(c)) for c in (profile.get("certifications") or [])
-             if str(c).strip()]
+    certs = [_clean_cert(str(c)) for c in (profile.get("certifications") or []) if str(c).strip()]
     certs = [c for c in certs if c]
     if certs:
         add_section("Certifications")
         for cert in certs:
             add_bullet(cert)
 
-    # ── 8. AWARDS ──────────────────────────────────────────────────────────
+    # ── 9. AWARDS ────────────────────────────────────────────────────────────────────
     awards = [str(a).strip() for a in (profile.get("awards") or []) if str(a).strip()]
     if awards:
         add_section("Awards & Honors")
@@ -747,21 +706,11 @@ def render_pdf(profile: dict, output_filename: str) -> str:
 
 # ---------------------------------------------------------------------------
 # Extract profile from uploaded base resume (PDF / DOCX / TXT)
-# Called by app.py /api/profile/upload-resume
 # ---------------------------------------------------------------------------
-
 def extract_profile_from_file(file_path: str) -> dict:
-    """
-    Extract full structured profile from a resume file using Claude.
-    Called ONCE on upload — result saved to DB, never re-read from file.
-
-    Strategy: split long resumes into two chunks, extract from each,
-    then merge so no job/project/skill is ever truncated away.
-    """
     fpath = Path(file_path)
     ext   = fpath.suffix.lower()
 
-    # ── 1. Read raw text ─────────────────────────────────────────────────────
     raw = ""
     try:
         if ext == ".pdf":
@@ -782,26 +731,24 @@ def extract_profile_from_file(file_path: str) -> dict:
     if not raw:
         return {"error": "No text could be extracted from the file"}
 
-    # Always store raw text so profile UI can display it
     result_base = {"raw_resume_text": raw[:15000]}
 
     if not os.environ.get("ANTHROPIC_API_KEY"):
         return result_base
 
-    # ── 2. Build extraction prompt ────────────────────────────────────────────
     SCHEMA = (
-        '{"name":"","email":"","phone":"","location":"","linkedin":"","github":"",'
-        '"website":"","title":"","summary":"","years_experience":0,"current_company":"",'
-        '"target_roles":[],'
-        '"experience":['
-        '{"title":"","company":"","location":"","dates":"","bullets":[]}'
-        '],'
-        '"education":['
-        '{"degree":"","school":"","location":"","dates":"","gpa":"","honors":""}'
-        '],'
-        '"projects":['
-        '{"name":"","technologies":"","dates":"","url":"","bullets":[]}'
-        '],'
+        '{"name":"","email":"","phone":"","location":"","linkedin":"","github":"",' 
+        '"website":"","title":"","summary":"","years_experience":0,"current_company":"",' 
+        '"target_roles":[],' 
+        '"experience":[' 
+        '{"title":"","company":"","location":"","dates":"","bullets":[]}' 
+        '],' 
+        '"education":[' 
+        '{"degree":"","school":"","location":"","dates":"","gpa":"","honors":""}' 
+        '],' 
+        '"projects":[' 
+        '{"name":"","technologies":"","dates":"","url":"","bullets":[]}' 
+        '],' 
         '"skills":[],"ml_skills":[],"tools":[],"certifications":[],"awards":[]}'
     )
 
@@ -822,12 +769,10 @@ def extract_profile_from_file(file_path: str) -> dict:
         raw_resp = _call_claude(prompt, SYSTEM, max_tokens=4096)
         return _parse_json_response(raw_resp)
 
-    # ── 3. Single call if resume fits; two calls if long ─────────────────────
-    CHUNK = 7500   # safe limit — well below Claude's context, gives full jobs
+    CHUNK = 7500
     if len(raw) <= CHUNK:
         data = _extract_chunk(raw)
     else:
-        # Split at a natural boundary near the midpoint
         mid   = len(raw) // 2
         split = raw.rfind("\n\n", mid - 500, mid + 500)
         if split == -1:
@@ -838,24 +783,20 @@ def extract_profile_from_file(file_path: str) -> dict:
         d1 = _extract_chunk(first_half,  " (PART 1 of 2 — header + first jobs)")
         d2 = _extract_chunk(second_half, " (PART 2 of 2 — remaining jobs, projects, skills, certs)")
 
-        # Merge: take header/contact from part 1, merge lists from both
         data = d1 if isinstance(d1, dict) else {}
         if isinstance(d2, dict):
-            # Append jobs from part 2 that aren't already in part 1
             existing_cos = {e.get("company","").lower() for e in (data.get("experience") or [])}
             for exp in (d2.get("experience") or []):
                 if exp.get("company","").lower() not in existing_cos:
                     data.setdefault("experience", []).append(exp)
                     existing_cos.add(exp.get("company","").lower())
 
-            # Append projects from part 2
             existing_proj = {p.get("name","").lower() for p in (data.get("projects") or [])}
             for proj in (d2.get("projects") or []):
                 if proj.get("name","").lower() not in existing_proj:
                     data.setdefault("projects", []).append(proj)
                     existing_proj.add(proj.get("name","").lower())
 
-            # Merge skills (union, dedup)
             for key in ("skills", "ml_skills", "tools", "certifications", "awards"):
                 combined = list(dict.fromkeys(
                     (data.get(key) or []) + (d2.get(key) or [])
@@ -863,13 +804,11 @@ def extract_profile_from_file(file_path: str) -> dict:
                 if combined:
                     data[key] = combined
 
-            # Fill blank contact fields from part 2 if part 1 missed them
             for field in ("name","email","phone","location","linkedin","github",
                           "website","title","summary","current_company"):
                 if not data.get(field) and d2.get(field):
                     data[field] = d2[field]
 
-            # Education — merge
             existing_schools = {e.get("school","").lower() for e in (data.get("education") or [])}
             for edu in (d2.get("education") or []):
                 if edu.get("school","").lower() not in existing_schools:
@@ -878,8 +817,6 @@ def extract_profile_from_file(file_path: str) -> dict:
     if not isinstance(data, dict):
         return result_base
 
-    # ── 4. Post-process ───────────────────────────────────────────────────────
-    # Normalise bullet strings → lists
     for section in ("experience", "projects"):
         for item in (data.get(section) or []):
             if isinstance(item.get("bullets"), str):
@@ -887,7 +824,6 @@ def extract_profile_from_file(file_path: str) -> dict:
                                    for b in re.split(r"[\n•]", item["bullets"])
                                    if b.strip("• ").strip()]
 
-    # Calculate years_experience from date spans if Claude didn't extract it
     if not data.get("years_experience") and data.get("experience"):
         total = 0
         cy    = datetime.now().year
@@ -900,7 +836,6 @@ def extract_profile_from_file(file_path: str) -> dict:
         if total > 0:
             data["years_experience"] = max(1, round(total / 12))
 
-    # Add raw text
     data["raw_resume_text"] = raw[:15000]
     return data
 
@@ -910,9 +845,6 @@ def extract_profile_from_file(file_path: str) -> dict:
 # ---------------------------------------------------------------------------
 def generate(profile: dict, job_description: str = "",
              job_title: str = "Role", company: str = "Company") -> dict:
-    """
-    Tailor resume content for a job, render to PDF, return result dict.
-    """
     if not REPORTLAB_AVAILABLE:
         return {"error": "reportlab not installed — run: pip install reportlab"}
 
@@ -925,22 +857,19 @@ def generate(profile: dict, job_description: str = "",
           f"{len(profile.get('education') or [])} edu | "
           f"{len(profile.get('projects') or [])} projects")
 
-    # Tailor content if JD is provided
     if job_description.strip() and os.environ.get("ANTHROPIC_API_KEY"):
-        print("  Tailoring with Claude...")
+        print("  Tailoring with Claude…")
         tailored = tailor_for_job(profile, job_description, job_title, company)
     else:
         tailored = dict(profile)
 
     keywords_added = tailored.pop("keywords_added", [])
 
-    # Generate filename
     co       = re.sub(r"\W+", "_", company)[:16]
     ti       = re.sub(r"\W+", "_", job_title)[:20]
     ts       = datetime.now().strftime("%Y%m%d_%H%M%S")
     filename = f"resume_{co}_{ti}_{ts}.pdf"
 
-    # Render PDF
     try:
         pdf_path = render_pdf(tailored, filename)
     except Exception as exc:
@@ -948,13 +877,12 @@ def generate(profile: dict, job_description: str = "",
         traceback.print_exc()
         return {"error": f"PDF render failed: {exc}"}
 
-    # ATS score
     job_stub = {
         "title":       job_title,
         "company":     company,
         "description": job_description,
     }
-    score = ats_score_job(tailored, job_stub) if job_description.strip() else {}  # Score AFTER tailoring
+    score = ats_score_job(tailored, job_stub) if job_description.strip() else {}
 
     print(f"  Done: {filename}")
     return {
