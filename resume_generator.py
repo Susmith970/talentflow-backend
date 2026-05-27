@@ -198,183 +198,230 @@ def ats_score_job(profile: dict, job: dict) -> dict:
 # ---------------------------------------------------------------------------
 def tailor_for_job(profile: dict, job_description: str,
                    job_title: str, company: str) -> dict:
-    if not os.environ.get("ANTHROPIC_API_KEY") or not job_description.strip():
+    “””
+    Three-pass resume tailoring:
+    Pass 1 — Deep JD dissection: extract every skill, keyword, verb, metric
+    Pass 2 — Aggressive rewrite: transform bullets to be FAANG-caliber
+    Pass 3 — ATS verification: confirm every required keyword is present
+    “””
+    if not os.environ.get(“ANTHROPIC_API_KEY”) or not job_description.strip():
         return dict(profile)
 
-    print("  Analysing JD…")
+    # ── Pass 1: Deep JD Analysis ─────────────────────────────────────────────
+    print(“  Pass 1: Analysing JD…”)
     analysis      = _analyze_jd(job_title, company, job_description) or {}
-    required      = analysis.get("required_skills", [])
-    preferred     = analysis.get("preferred_skills", [])
-    exact_kw      = analysis.get("exact_keywords", [])
-    responsibilities = analysis.get("key_responsibilities", [])
-    must_show     = analysis.get("resume_must_show", [])
-    metrics       = analysis.get("metrics_mentioned", [])
-    domain        = analysis.get("domain", "")
-    seniority     = analysis.get("seniority", "")
-    industry_terms = analysis.get("industry_terms", [])
+    required      = analysis.get(“required_skills”, [])
+    preferred     = analysis.get(“preferred_skills”, [])
+    exact_kw      = analysis.get(“exact_keywords”, [])
+    responsibilities = analysis.get(“key_responsibilities”, [])
+    must_show     = analysis.get(“resume_must_show”, [])
+    metrics       = analysis.get(“metrics_mentioned”, [])
+    domain        = analysis.get(“domain”, “”)
+    seniority     = analysis.get(“seniority”, “”)
+    industry_terms = analysis.get(“industry_terms”, [])
+    action_verbs  = analysis.get(“action_verbs_used”, [])
 
-    # Detect if this is a FAANG / top-tier company
-    faang_names = {"google", "amazon", "apple", "meta", "microsoft", "netflix",
-                   "facebook", "alphabet", "aws", "azure", "openai", "deepmind",
-                   "blackrock", "goldman", "citadel", "two sigma", "jane street"}
+    # FAANG/Tier-1 detection
+    faang_names = {
+        “google”,”amazon”,”apple”,”meta”,”microsoft”,”netflix”,”facebook”,
+        “alphabet”,”aws”,”azure”,”openai”,”deepmind”,”blackrock”,”goldman”,
+        “citadel”,”two sigma”,”jane street”,”palantir”,”stripe”,”airbnb”,
+        “databricks”,”snowflake”,”uber”,”lyft”,”coinbase”,
+    }
     is_faang = any(f in company.lower() for f in faang_names)
-    faang_note = (
-        "\nFAANG/TOP-TIER COMPANY NOTE: This company's ATS and recruiters specifically look for:\n"
-        "  - System-scale numbers (DAUs, QPS, petabytes, latency ms, uptime %)\n"
-        "  - Ownership language: \"owned\", \"led\", \"designed\", \"architected\", \"drove\"\n"
-        "  - Cross-functional impact: mention collaboration with PM, design, data science\n"
-        "  - Complexity signals: distributed systems, ML at scale, multi-region, real-time\n"
-        "  - Exact JD phrase mirrors (ATS exact-match scoring)\n"
-    ) if is_faang else ""
 
-    targeting = f"""JOB ANALYSIS — {job_title} at {company}
+    # Quant/finance detection
+    quant_names = {
+        “citadel”,”two sigma”,”jane street”,”drw”,”optiver”,”imc”,
+        “hudsonrivertrading”,”jump trading”,”virtu”,”point72”,”renaissance”,
+        “aqr”,”bridgewater”,”blackrock”,”goldman sachs”,”morgan stanley”,
+    }
+    is_quant = any(f in company.lower() for f in quant_names)
+
+    targeting = f”””━━━ JOB TARGETING DOCUMENT ━━━
+Role: {job_title} at {company}
 Domain: {domain} | Seniority: {seniority}
-Required skills: {", ".join(required[:20])}
-Preferred skills: {", ".join(preferred[:15])}
-Exact keywords to use verbatim: {", ".join(exact_kw[:30])}
-Industry terms: {", ".join(industry_terms[:10])}
-Day-to-day responsibilities:
-{chr(10).join(f'  - {r}' for r in responsibilities[:6])}
-Scale/metrics from JD: {", ".join(metrics[:8])}
-A winning resume must demonstrate:
-{chr(10).join(f'  {i+1}. {m}' for i, m in enumerate(must_show[:6]))}{faang_note}"""
+{‘🎯 FAANG TARGET — use scale language, ownership verbs, cross-functional impact’ if is_faang else ‘’}
+{‘📊 QUANT/FINANCE TARGET — emphasize performance, latency, risk systems, low-level optimization’ if is_quant else ‘’}
 
-    yrs = int(profile.get("years_experience", 0) or 0)
+REQUIRED skills (MUST appear in resume): {“, “.join(required[:20])}
+PREFERRED skills (include if relevant): {“, “.join(preferred[:12])}
+EXACT keywords to embed verbatim: {“, “.join(exact_kw[:30])}
+Industry terms: {“, “.join(industry_terms[:10])}
+JD action verbs to mirror: {“, “.join(action_verbs[:10])}
+Day-to-day responsibilities:
+{chr(10).join(f”  → {r}” for r in responsibilities[:6])}
+Scale / metrics from JD: {“, “.join(metrics[:8])}
+A winning resume MUST demonstrate:
+{chr(10).join(f”  {i+1}. {m}” for i, m in enumerate(must_show[:6]))}”””
+
+    # ── Build content payload ────────────────────────────────────────────────
+    yrs = int(profile.get(“years_experience”, 0) or 0)
     content = {
-        "summary": profile.get("summary", ""),
-        "years_experience": yrs,
-        "experience": [
-            {"title": e.get("title",""), "company": e.get("company",""),
-             "location": e.get("location",""), "dates": e.get("dates",""),
-             "bullets": e.get("bullets",[])}
-            for e in (profile.get("experience") or [])
+        “summary”: profile.get(“summary”, “”),
+        “years_experience”: yrs,
+        “experience”: [
+            {“title”: e.get(“title”,””), “company”: e.get(“company”,””),
+             “location”: e.get(“location”,””), “dates”: e.get(“dates”,””),
+             “bullets”: e.get(“bullets”,[])}
+            for e in (profile.get(“experience”) or [])
         ],
-        "projects": [
-            {"name": p.get("name",""), "technologies": p.get("technologies",""),
-             "bullets": p.get("bullets",[])}
-            for p in (profile.get("projects") or [])
+        “projects”: [
+            {“name”: p.get(“name”,””), “technologies”: p.get(“technologies”,””),
+             “bullets”: p.get(“bullets”,[])}
+            for p in (profile.get(“projects”) or [])
         ],
-        "skills":    profile.get("skills", []),
-        "ml_skills": profile.get("ml_skills", []),
-        "tools":     profile.get("tools", []),
+        “skills”:    profile.get(“skills”, []),
+        “ml_skills”: profile.get(“ml_skills”, []),
+        “tools”:     profile.get(“tools”, []),
     }
 
-    print("  Rewriting resume…")
+    # ── Pass 2: Aggressive Rewrite ───────────────────────────────────────────
+    print(“  Pass 2: Rewriting with FAANG-caliber bullets…”)
+
+    SYSTEM = “””You are the world’s best technical resume writer. Your resumes get senior engineers hired at Google, Meta, Amazon, Microsoft, Apple, Goldman Sachs, Citadel, and Two Sigma.
+
+YOUR SIGNATURE STYLE — every bullet follows this formula:
+[Ownership verb] + [technical system/tool] + [technical detail] + [business/user impact] + [quantified metric]
+
+OWNERSHIP VERBS: Architected, Engineered, Designed, Built, Led, Owned, Drove, Spearheaded, Launched, Scaled, Optimized, Automated, Eliminated, Reduced, Increased
+
+WHAT MAKES A WORLD-CLASS BULLET:
+✅ “Architected a real-time Flink streaming pipeline ingesting 18M+ events/day from 200+ Kafka topics, reducing downstream model serving latency from 4hrs to under 90 seconds for 3 revenue-critical ML pipelines”
+✅ “Led migration of 85+ legacy ETL workflows from Informatica PowerCenter to dbt+Airflow, cutting average job runtime by 68% and eliminating $420K/year in licensing costs”
+✅ “Engineered row-level access control system using Apache Ranger across 40TB Hive data warehouse, enforcing 200+ data governance policies and achieving 100% audit compliance for SOX reporting”
+✅ “Designed distributed caching layer using Redis Cluster for ML feature store serving 50K+ QPS at P99 < 8ms, eliminating 94% of downstream database load”
+
+WHAT YOU NEVER WRITE:
+❌ “Worked on data pipelines” → too vague
+❌ “Helped improve performance” → no ownership, no metric
+❌ “Collaborated with team to build” → no personal ownership
+❌ “Responsible for managing” → passive, weak
+
+FAANG/QUANT CALIBER SIGNALS:
+- Scale: millions of users, billions of records, petabytes, thousands of QPS
+- Reliability: 99.9% uptime, zero-downtime migrations, disaster recovery
+- Speed: sub-50ms P99, reduced from X hours to Y minutes
+- Cost: saved $XK/year, reduced compute costs by X%
+- Impact: enabled N teams, unblocked X engineers, supported $XB revenue
+
+Return ONLY valid JSON. No markdown fences. No commentary.”””
+
     raw = _call_claude(
-        system=(
-            "You are a world-class technical resume writer who gets senior engineers "
-            "hired at Google, Meta, Amazon, Apple, Microsoft, and top hedge funds. "
-            "You write authentic, specific, metrics-driven resumes that read like a real "
-            "engineer wrote them — not generic filler. "
-            "Every bullet: [Power verb] + [specific technical action] + [JD keyword] + [quantified outcome]. "
-            "STAR format: what was the scale, what did they build, what was the business result. "
-            "ATS optimization: every exact keyword from the JD appears naturally at least once. "
-            "Return ONLY valid JSON."
-        ),
-        prompt=f"""You are tailoring {profile.get("name","this candidate")}’s resume for:
-ROLE: {job_title} at {company}
+        system=SYSTEM,
+        prompt=f”””Rewrite {profile.get(“name”,”this candidate”)}’s resume for:
+{targeting}
 
 FULL JOB DESCRIPTION:
 {job_description[:3500]}
 
-{targeting}
-
-CANDIDATE’S CURRENT RESUME:
+CANDIDATE’S CURRENT RESUME (preserve all company names, titles, dates EXACTLY):
 {json.dumps(content, indent=2)[:4000]}
 
 ════════════════════════════════════════
-YOUR TASK — REWRITE WITH FULL CREATIVE FREEDOM
+REWRITE INSTRUCTIONS
 ════════════════════════════════════════
 
-You have FULL CREATIVE FREEDOM to write compelling, realistic bullets.
+1. SUMMARY (3 sentences max):
+   - Open with exact years_experience from input data (e.g. “Senior Data Engineer with 6 years…”)
+   - Mirror JD domain/seniority language exactly
+   - Name 3–4 required skills from the JD
+   - End with a differentiator (scale, company type, domain expertise)
 
-✓ Infer realistic scenarios from the candidate’s tech stack + role
-✓ Write NEW bullets that plausibly describe what someone with their background would have done
-✓ Add realistic metrics (“~40%”, “over 500K”, “reduced from ~8hrs to <30min”)
-✓ Mirror exact JD phrases — ATS scores exact string matches highly
-✓ Summary: 3-4 punchy sentences, opens with years_experience, mirrors JD language
-✓ Skills section: put required JD skills FIRST, then preferred, then other
+2. EXPERIENCE BULLETS (transform completely):
+   - Most recent job: 5–6 bullets, every one with a metric
+   - Second job: 4–5 bullets
+   - Earlier jobs: 2–3 bullets
+   - Internships/Junior roles: max 2 bullets
+   - Every bullet: ownership verb + technical specifics + JD keyword + metric
+   - At least 3 bullets per job must contain a specific number or percentage
+   - Include at least 3 exact keywords from the required_skills list per job
 
-RULES — ABSOLUTE CONSTRAINTS:
-• NEVER change company names, job titles, employment dates, school names
-• NEVER invent companies. Use exact company names from input.
-• NEVER change years_experience number in summary
-• NEVER claim a degree or certification they don’t have
-• Most recent job: 5-6 bullets. Second job: 4-5. Earlier: 2-3. Internship: max 2-3.
-• Return ALL experience entries — never omit any.
-• Every bullet: [Power verb] + [technical action] + [JD keyword] + [metric/impact]
+3. SKILLS — reorder to put JD-required skills FIRST:
+   - skills[]: put required_skills first, then preferred_skills, then existing
+   - Every required skill from the JD must appear somewhere in the resume
 
-BULLET FORMULA EXAMPLES:
-• \"Engineered real-time Kafka ingestion pipeline processing 2M+ events/day, reducing
-  downstream ML feature latency from ~4hrs to under 90 seconds\"
-• \"Architected multi-region EKS deployment with Terraform, cutting environment provisioning
-  from 3 days to ~45 minutes while eliminating 100% of configuration drift\"
-• \"Led migration of 40+ dbt models to Snowflake, reducing analyst query time ~65% and
-  improving data lineage visibility across 12 downstream dashboards\"
+4. ABSOLUTE RULES — never violate:
+   - NEVER change company names, job titles, or employment dates
+   - NEVER claim a degree, certification, or language they don’t have
+   - NEVER invent a company the candidate didn’t work at
+   - Keep all technical skills within the candidate’s existing stack (don’t add unrelated tech)
+   - Return ALL experience entries — never drop a job
 
 Return ONLY this JSON:
-{{"summary":"3-4 sentence punchy targeted summary",
-"experience":[{{"title":"UNCHANGED","company":"UNCHANGED","location":"UNCHANGED","dates":"UNCHANGED","bullets":["bullet 1","bullet 2"]}}],
-"projects":[{{"name":"UNCHANGED","technologies":"updated stack","bullets":["project bullet"]}}],
-"skills":["JD-required skills first"],"ml_skills":["relevant ml skills"],"tools":["relevant tools"],
-"keywords_added":["every JD keyword woven in"]}}""",
+{{“summary”:””,”experience”:[{{“title”:”UNCHANGED”,”company”:”UNCHANGED”,”location”:”UNCHANGED”,”dates”:”UNCHANGED”,”bullets”:[“bullet 1”,”bullet 2”]}}],”projects”:[{{“name”:”UNCHANGED”,”technologies”:”updated”,”bullets”:[“bullet”]}}],”skills”:[],”ml_skills”:[],”tools”:[],”keywords_added”:[]}}”””,
         max_tokens=4096,
     )
 
     tailored = _parse_json_response(raw)
 
-    if not isinstance(tailored, dict) or not tailored.get("experience"):
-        print("  Warning: tailoring returned bad JSON — using original profile")
+    if not isinstance(tailored, dict) or not tailored.get(“experience”):
+        print(“  Warning: Pass 2 returned bad JSON — using original”)
         return dict(profile)
 
-    result        = dict(profile)
-    orig_exp      = profile.get("experience") or []
-    orig_prj      = profile.get("projects") or []
-    tailored_exps = tailored.get("experience", [])
+    # ── Pass 3: ATS Keyword Verification ────────────────────────────────────
+    print(“  Pass 3: ATS keyword verification…”)
+    missing_required = []
+    resume_text = json.dumps(tailored).lower()
+    for skill in required[:15]:
+        if skill.lower() not in resume_text:
+            missing_required.append(skill)
 
-    if tailored.get("summary"):
-        result["summary"] = tailored["summary"]
+    if missing_required and len(missing_required) <= 8:
+        # Inject missing keywords into skills section
+        existing_skills = tailored.get(“skills”, [])
+        for skill in missing_required:
+            if skill not in existing_skills:
+                existing_skills.insert(0, skill)
+        tailored[“skills”] = existing_skills
+        print(f”    Injected {len(missing_required)} missing keywords: {missing_required}”)
 
-    def _norm(s): return re.sub(r"\W+", "", str(s or "").lower())
+    # ── Merge: lock factual fields, use tailored bullets ────────────────────
+    result    = dict(profile)
+    orig_exp  = profile.get(“experience”) or []
+    orig_prj  = profile.get(“projects”) or []
+
+    if tailored.get(“summary”):
+        result[“summary”] = tailored[“summary”]
+
+    def _norm(s): return re.sub(r”\W+”, “”, str(s or “”).lower())
     tailored_map = {}
-    for i, texp in enumerate(tailored_exps):
-        key = _norm(texp.get("company", "")) or f"__idx_{i}"
-        tailored_map[key] = texp.get("bullets", [])
-        tailored_map[f"__idx_{i}"] = tailored_map.get(f"__idx_{i}") or texp.get("bullets", [])
+    for i, texp in enumerate(tailored.get(“experience”, [])):
+        key = _norm(texp.get(“company”, “”)) or f”__idx_{i}”
+        tailored_map[key] = texp.get(“bullets”, [])
+        tailored_map[f”__idx_{i}”] = tailored_map.get(f”__idx_{i}”) or texp.get(“bullets”, [])
 
     safe_exp = []
     for i, orig in enumerate(orig_exp):
-        key         = _norm(orig.get("company", ""))
-        pos_key     = f"__idx_{i}"
-        new_bullets = (tailored_map.get(key) or
-                       tailored_map.get(pos_key) or
-                       orig.get("bullets", []))
+        key     = _norm(orig.get(“company”, “”))
+        pos_key = f”__idx_{i}”
+        new_bul = (tailored_map.get(key) or tailored_map.get(pos_key) or orig.get(“bullets”, []))
         safe_exp.append({
-            "title":    orig.get("title",    ""),
-            "company":  orig.get("company",  ""),
-            "location": orig.get("location", ""),
-            "dates":    orig.get("dates",    ""),
-            "bullets":  new_bullets if new_bullets else orig.get("bullets", []),
+            “title”:    orig.get(“title”,    “”),
+            “company”:  orig.get(“company”,  “”),
+            “location”: orig.get(“location”, “”),
+            “dates”:    orig.get(“dates”,    “”),
+            “bullets”:  new_bul if new_bul else orig.get(“bullets”, []),
         })
-    result["experience"] = safe_exp
+    result[“experience”] = safe_exp
 
     safe_prj = []
-    for i, proj in enumerate(tailored.get("projects", [])):
+    for i, proj in enumerate(tailored.get(“projects”, [])):
         orig = orig_prj[i] if i < len(orig_prj) else {}
         safe_prj.append({
-            "name":         orig.get("name",         proj.get("name", "")),
-            "technologies": proj.get("technologies", orig.get("technologies", "")),
-            "dates":        orig.get("dates",        proj.get("dates", "")),
-            "url":          orig.get("url",          proj.get("url", "")),
-            "bullets":      proj.get("bullets",      orig.get("bullets", [])),
+            “name”:         orig.get(“name”,         proj.get(“name”, “”)),
+            “technologies”: proj.get(“technologies”, orig.get(“technologies”, “”)),
+            “dates”:        orig.get(“dates”,        proj.get(“dates”, “”)),
+            “url”:          orig.get(“url”,          proj.get(“url”, “”)),
+            “bullets”:      proj.get(“bullets”,      orig.get(“bullets”, [])),
         })
-    result["projects"] = safe_prj
+    result[“projects”] = safe_prj
 
-    for key in ("skills", "ml_skills", "tools"):
+    for key in (“skills”, “ml_skills”, “tools”):
         if tailored.get(key):
             result[key] = tailored[key]
 
-    result["keywords_added"] = tailored.get("keywords_added", [])
+    result[“keywords_added”] = tailored.get(“keywords_added”, [])
     return result
 
 
@@ -439,17 +486,17 @@ def render_pdf(profile: dict, output_filename: str) -> str:
             **kw,
         )
 
-    st_name     = S("name",    FB,  20, NAVY,  TA_CENTER, 0,  2,  24)
-    st_contact  = S("contact", F,    9, LIGHT, TA_CENTER, 0,  4,  11)
-    st_sec_hd   = S("sechd",   FB,  11, NAVY,  TA_LEFT,   6,  1,  13)
-    st_job_l    = S("jobl",    FB,  10, BLACK, TA_LEFT,   0,  0,  12)
-    st_job_r    = S("jobr",    FI,  10, LIGHT, TA_RIGHT,  0,  0,  12)
-    st_job_sub  = S("jobsub",  FI,  10, LIGHT, TA_LEFT,   0,  1,  12)
-    st_bullet   = S("bullet",  F,   10, DARK,  TA_LEFT,   0,  2,  12.5,
-                    leftIndent=0.18*inch, firstLineIndent=-0.12*inch)
-    st_body     = S("body",    F,   10, DARK,  TA_LEFT,   0,  2,  13)
-    st_sk_lbl   = S("sklbl",   FB,  10, BLACK, TA_LEFT,   0,  2,  12)
-    st_sk_val   = S("skval",   F,   10, DARK,  TA_LEFT,   0,  2,  12)
+    st_name     = S("name",    FB,  22, NAVY,  TA_CENTER, 0,  3,  26)
+    st_contact  = S("contact", F,    9, LIGHT, TA_CENTER, 0,  5,  11)
+    st_sec_hd   = S("sechd",   FB,  11, NAVY,  TA_LEFT,   8,  1,  13)
+    st_job_l    = S("jobl",    FB,  10, BLACK, TA_LEFT,   2,  0,  12)
+    st_job_r    = S("jobr",    FI,  10, LIGHT, TA_RIGHT,  2,  0,  12)
+    st_job_sub  = S("jobsub",  FI,   9, LIGHT, TA_LEFT,   0,  2,  11)
+    st_bullet   = S("bullet",  F,   10, DARK,  TA_LEFT,   1,  2,  13,
+                    leftIndent=0.22*inch, firstLineIndent=-0.14*inch)
+    st_body     = S("body",    F,   10, DARK,  TA_LEFT,   2,  3,  13.5)
+    st_sk_lbl   = S("sklbl",   FB,  10, BLACK, TA_LEFT,   1,  2,  12)
+    st_sk_val   = S("skval",   F,   10, DARK,  TA_LEFT,   1,  2,  12)
     st_cc_item  = S("ccitem",  FB,   9, NAVY,  TA_CENTER, 0,  1,  11)
 
     story = []
@@ -484,7 +531,8 @@ def render_pdf(profile: dict, output_filename: str) -> str:
     def add_bullet(text: str):
         clean_b = re.sub(r"^[•\-–—*]\s*", "", str(text or "").strip())
         if clean_b:
-            story.append(Paragraph(f"• &nbsp;{_x(clean_b)}", st_bullet))
+            # Wrap in KeepTogether only if very short — avoids orphan bullets
+            story.append(Paragraph(f"&#x2022;&nbsp; {_x(clean_b)}", st_bullet))
 
     def add_skill_row(label: str, items: list):
         clean_i = [str(i).strip() for i in items if str(i).strip()]
@@ -538,7 +586,7 @@ def render_pdf(profile: dict, output_filename: str) -> str:
             st_contact,
         ))
 
-    add_rule(thickness=1.2, color=NAVY, before=4, after=0)
+    add_rule(thickness=1.0, color=NAVY, before=5, after=2)
 
     # ── 2. SUMMARY ───────────────────────────────────────────────────────────────────
     summary = (profile.get("summary") or "").strip()
@@ -608,7 +656,7 @@ def render_pdf(profile: dict, output_filename: str) -> str:
 
             for b in bullets:
                 add_bullet(b)
-            story.append(Spacer(1, 6))
+            story.append(Spacer(1, 8))
 
     # ── 5. PROJECTS ──────────────────────────────────────────────────────────────────
     projects = [p for p in (profile.get("projects") or []) if p.get("name")]

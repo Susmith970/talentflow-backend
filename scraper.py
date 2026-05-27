@@ -628,29 +628,45 @@ GREENHOUSE_BOARDS = [
     "plaid", "brex", "ramp", "mercury", "moderntreasury",
     "rippling", "gusto", "lattice", "leapsome",
     # Healthcare / Other
-    "tempus", "flatiron", "komodohealth", "babylonhealth",
+    "tempus", "flatiron", "komodohealth",
     # ── H1B Sponsor Tech Unicorns ──────────────────────────────────────────
     "openai", "snowflake", "palantir", "confluent", "cockroachdb",
     "rubrik", "toast", "launchdarkly", "hashicorp", "pagerduty",
     "benchling", "samsara", "block", "square",
-    "pinterest", "snap", "twitter",
+    "pinterest", "snap",
     "servicenow", "splunk", "new-relic", "fastly",
     "checkr", "gong", "highspot",
-    # ── Financial Services — major H1B sponsors ────────────────────────────
+    "figma", "canva", "notion",
+    "vercel", "netlify", "supabase",
+    "scale-ai", "labelbox", "appen",
+    # ── Financial Services — confirmed H1B sponsors ────────────────────────
     "bloomberg", "two-sigma", "citadel", "drw",
     "jane-street", "optiver", "imc-trading",
     "point72", "bridgewater", "aqr-capital",
-    # BlackRock / JPMorgan / Goldman use various ATS — try anyway
+    "virtu", "hudsonrivertrading", "jump-trading",
     "blackrock-inc", "jpmc", "goldmansachs", "morganstanley",
-    "citi-technology",
+    "citi-technology", "wells-fargo-careers",
+    "americanexpress", "visa-inc", "mastercard",
+    "fidelity", "vanguard", "schwab",
+    "pnc", "usaa",
+    # ── Consulting / Professional Services (H1B) ───────────────────────────
+    "thoughtworks", "accenture", "cognizant-technology-solutions",
+    "infosys", "wipro", "tcs",
     # ── Automotive / Autonomous Vehicles ──────────────────────────────────
-    "waymo", "cruise", "aurora-innovation", "zoox",
+    "waymo", "cruise", "aurora-innovation", "zoox", "nuro",
+    "rivian", "lucidmotors",
     # ── Healthcare / Biotech (H1B sponsors) ───────────────────────────────
     "modernatx", "illumina", "10xgenomics", "grail",
     "23andme", "guardanthealth", "exactsciences",
-    # ── More consumer/enterprise tech ─────────────────────────────────────
+    "recursion", "insitro",
+    # ── Consumer / Enterprise tech ────────────────────────────────────────
     "doordash", "instacart", "opendoor",
-    "scale-ai", "labelbox",
+    "uber", "lyft", "airbnb",
+    "expedia", "booking-holdings", "tripadvisor",
+    "salesforce", "oracle", "sap",
+    "adobe", "autodesk", "intuit",
+    "workday", "hubspot", "zendesk",
+    "atlassian", "freshworks", "sprinklr",
 ]
 
 def scrape_greenhouse(roles):
@@ -1207,91 +1223,188 @@ def scrape_microsoft_jobs(roles):
 def scrape_meta_jobs(roles):
     print("  [Meta Jobs] scraping …")
     jobs, seen = [], set()
+
+    # Meta uses a React app. Try their internal search API first, then HTML parsing.
+    META_EXTRA = {
+        "Accept": "application/json, text/plain, */*",
+        "Referer": "https://www.metacareers.com/jobs/",
+        "Origin": "https://www.metacareers.com",
+        "X-FB-Friendly-Name": "CareersJobSearchResultsQuery",
+    }
+
     for role in roles[:3]:
         q = urllib.parse.quote(role)
-        url = f"https://www.metacareers.com/jobs/?q={q}&locations[0]=United+States"
-        html = fetch(url, extra={
-            "Accept": "text/html,application/xhtml+xml,*/*;q=0.9",
-            "Referer": "https://www.metacareers.com/",
-        })
-        if not html:
-            continue
-        # Try __NEXT_DATA__ embedded JSON
-        next_m = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, re.DOTALL)
-        if next_m:
-            try:
-                nd = json.loads(next_m.group(1))
-                props    = nd.get("props", {})
-                page_props = props.get("pageProps", {})
-                jobs_list  = (page_props.get("jobs") or
-                              page_props.get("initialData", {}).get("jobs") or [])
-                for j in jobs_list[:30]:
-                    title = j.get("title", j.get("name", ""))
-                    if not role_matches(title, j.get("description", "")[:300], roles):
-                        continue
-                    uid = str(j.get("id", ""))
-                    if not uid:
-                        uid = str(abs(hash(title)))
-                    if uid in seen:
-                        continue
-                    seen.add(uid)
-                    loc_obj = j.get("location", j.get("jobLocation", {}))
-                    if isinstance(loc_obj, dict):
-                        loc = loc_obj.get("city", loc_obj.get("name", "Menlo Park, CA"))
-                    else:
-                        loc = str(loc_obj) if loc_obj else "Menlo Park, CA"
-                    if not is_us_location(loc):
-                        continue
-                    posted = j.get("post_date", j.get("datePosted", "Today"))
-                    if not is_recent(posted, hours=168):
-                        continue
-                    job_url = f"https://www.metacareers.com/jobs/{uid}"
-                    _mj = make_job(
-                        f"meta_{uid}", title, "Meta", loc, "Meta Jobs",
-                        job_url, posted,
-                        clean(j.get("description", ""))[:1500],
-                        apply_url=job_url,
-                    )
-                    if _mj:
-                        jobs.append(_mj)
-            except Exception as e:
-                print(f"    ⚠ Meta JSON parse: {e}")
-        # Fallback: JSON-LD
-        if not jobs:
-            for block in re.findall(r'<script type="application/ld\+json">(.*?)</script>',
-                                    html, re.DOTALL):
+        parsed_jobs = []
+
+        # Strategy 1: Try internal v2 search API
+        for api_url in [
+            f"https://www.metacareers.com/jobs/search/?q={q}&locations%5B0%5D=United+States&page=1",
+            f"https://www.metacareers.com/careers/jobs/?q={q}&location=United+States",
+        ]:
+            raw = fetch(api_url, extra=META_EXTRA)
+            if raw:
                 try:
-                    obj = json.loads(block)
-                    if isinstance(obj, dict) and obj.get("@type") == "JobPosting":
-                        objs = [obj]
-                    elif isinstance(obj, list):
-                        objs = obj
-                    else:
-                        continue
-                    for item in objs:
-                        if not isinstance(item, dict): continue
-                        title = item.get("title", "")
-                        if not role_matches(title, "", roles): continue
-                        uid = str(abs(hash(title + item.get("datePosted", ""))))
-                        if uid in seen: continue
-                        seen.add(uid)
-                        job_url = item.get("url", "https://www.metacareers.com/jobs")
-                        _mj = make_job(
-                            f"meta_{uid}", title, "Meta", "Menlo Park, CA",
-                            "Meta Jobs", job_url,
-                            item.get("datePosted", "Today"),
-                            clean(item.get("description", ""))[:1500],
-                            apply_url=job_url,
-                        )
-                        if _mj: jobs.append(_mj)
+                    data = json.loads(raw)
+                    candidates = (data.get("jobs") or data.get("data", {}).get("jobs") or
+                                  data.get("results") or [])
+                    if candidates:
+                        parsed_jobs = candidates
+                        break
                 except Exception:
                     pass
+
+        # Strategy 2: Scrape HTML and extract embedded JSON
+        if not parsed_jobs:
+            html = fetch(
+                f"https://www.metacareers.com/jobs/?q={q}&locations[0]=United+States",
+                extra={"Accept": "text/html,application/xhtml+xml,*/*;q=0.9",
+                       "Referer": "https://www.metacareers.com/"}
+            )
+            if html:
+                # Try __NEXT_DATA__
+                m = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, re.DOTALL)
+                if m:
+                    try:
+                        nd = json.loads(m.group(1))
+                        pp = nd.get("props", {}).get("pageProps", {})
+                        candidates = (pp.get("jobs") or pp.get("initialJobs") or
+                                      pp.get("initialData", {}).get("jobs") or [])
+                        if candidates:
+                            parsed_jobs = candidates
+                    except Exception:
+                        pass
+
+                # Try window.__SSR_DATA__ or similar patterns
+                if not parsed_jobs:
+                    for pattern in [
+                        r'window\.__INITIAL_DATA__\s*=\s*(\{.*?\});',
+                        r'"jobs"\s*:\s*(\[.*?\])\s*[,}]',
+                        r'__SSR_DATA__[^=]*=\s*(\{.*?\})\s*;',
+                    ]:
+                        m2 = re.search(pattern, html, re.DOTALL)
+                        if m2:
+                            try:
+                                chunk = json.loads(m2.group(1))
+                                if isinstance(chunk, list) and chunk and isinstance(chunk[0], dict) and "title" in chunk[0]:
+                                    parsed_jobs = chunk
+                                    break
+                                elif isinstance(chunk, dict):
+                                    candidates = (chunk.get("jobs") or
+                                                  chunk.get("data", {}).get("jobs") or [])
+                                    if candidates:
+                                        parsed_jobs = candidates
+                                        break
+                            except Exception:
+                                pass
+
+                # JSON-LD fallback
+                if not parsed_jobs:
+                    for block in re.findall(r'<script[^>]*type=["\']application/ld\+json["\'][^>]*>(.*?)</script>', html, re.DOTALL):
+                        try:
+                            obj = json.loads(block)
+                            items = obj if isinstance(obj, list) else [obj]
+                            for item in items:
+                                if isinstance(item, dict) and item.get("@type") == "JobPosting":
+                                    parsed_jobs.append({
+                                        "title": item.get("title", ""),
+                                        "description": item.get("description", ""),
+                                        "id": str(abs(hash(item.get("title","") + item.get("datePosted","")))),
+                                        "location": {"city": "Menlo Park", "name": "Menlo Park, CA"},
+                                        "post_date": item.get("datePosted", "Today"),
+                                        "_url": item.get("url", "https://www.metacareers.com/jobs"),
+                                    })
+                        except Exception:
+                            pass
+
+        for j in parsed_jobs:
+            title = j.get("title", j.get("name", ""))
+            if not role_matches(title, j.get("description", "")[:300], roles):
+                continue
+            uid = str(j.get("id", j.get("jobId", "")))
+            if not uid:
+                uid = str(abs(hash(title + str(j.get("post_date","")))))
+            if uid in seen:
+                continue
+            seen.add(uid)
+            loc_obj = j.get("location", j.get("jobLocation", {}))
+            if isinstance(loc_obj, dict):
+                loc = loc_obj.get("city", loc_obj.get("name", loc_obj.get("addressLocality", "Menlo Park, CA")))
+            else:
+                loc = str(loc_obj) if loc_obj else "Menlo Park, CA"
+            if not is_us_location(loc):
+                continue
+            posted = j.get("post_date", j.get("datePosted", j.get("date", "Today")))
+            if not is_recent(posted, hours=168):
+                continue
+            job_url = j.get("_url", j.get("url", f"https://www.metacareers.com/jobs/{uid}"))
+            if not job_url.startswith("http"):
+                job_url = f"https://www.metacareers.com/jobs/{uid}"
+            _mj = make_job(
+                f"meta_{uid}", title, "Meta", loc, "Meta Jobs",
+                job_url, posted,
+                clean(j.get("description", ""))[:1500],
+                apply_url=job_url,
+            )
+            if _mj:
+                jobs.append(_mj)
         time.sleep(2.0)
     print(f"     ✓ {len(jobs)}")
     return jobs
 
 
-# ─── Source 21: Apify connector (LinkedIn + Indeed scrapers) ─────────────────
+# ─── Source 21: Netflix Jobs (direct API) ────────────────────────────────────
+
+def scrape_netflix_jobs(roles):
+    print("  [Netflix Jobs] scraping …")
+    jobs, seen = [], set()
+    for role in roles[:4]:
+        q = urllib.parse.quote(role)
+        url = f"https://jobs.netflix.com/api/search?q={q}&location=United+States&limit=20&team=&subteam=&type="
+        raw = fetch(url, extra={
+            "Accept": "application/json, text/plain, */*",
+            "Referer": "https://jobs.netflix.com/search",
+        })
+        if not raw:
+            time.sleep(1.5)
+            continue
+        try:
+            data = json.loads(raw)
+        except Exception:
+            time.sleep(1.5)
+            continue
+        for j in (data.get("records", {}).get("postings") or data.get("postings") or []):
+            title = j.get("text", j.get("title", ""))
+            if not role_matches(title, j.get("description", "")[:300], roles):
+                continue
+            uid = str(j.get("id", ""))
+            if not uid:
+                uid = str(abs(hash(title)))
+            if uid in seen:
+                continue
+            seen.add(uid)
+            loc = j.get("location", j.get("country", "United States"))
+            if isinstance(loc, dict):
+                loc = loc.get("name", "United States")
+            if not is_us_location(str(loc)):
+                continue
+            posted = j.get("updated_at", j.get("created_at", j.get("postedAt", "Today")))
+            if not is_recent(posted, hours=168):
+                continue
+            job_url = f"https://jobs.netflix.com/jobs/{uid}"
+            _mj = make_job(
+                f"nflx_{uid}", title, "Netflix", loc, "Netflix Jobs",
+                job_url, posted,
+                clean(j.get("description", ""))[:1500],
+                apply_url=job_url,
+            )
+            if _mj:
+                jobs.append(_mj)
+        time.sleep(1.5)
+    print(f"     ✓ {len(jobs)}")
+    return jobs
+
+
+# ─── Source 22: Apify connector (LinkedIn + Indeed scrapers) ─────────────────
 # Set APIFY_API_TOKEN env var to enable. Uses apify/linkedin-jobs-scraper.
 
 def scrape_apify(roles):
@@ -1427,6 +1540,7 @@ ALL_SCRAPERS = [
     ("Apple Jobs",       scrape_apple_jobs),
     ("Microsoft Jobs",   scrape_microsoft_jobs),
     ("Meta Jobs",        scrape_meta_jobs),
+    ("Netflix Jobs",     scrape_netflix_jobs),
     # Apify (only runs if APIFY_API_TOKEN is set)
     ("Apify",            scrape_apify),
 ]
